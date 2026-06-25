@@ -148,6 +148,7 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
         max_body_bytes: doc.server.max_body_bytes,
         shutdown_grace_ms: doc.server.shutdown_grace_ms,
         default_max_tokens: doc.server.default_max_tokens,
+        moa_expose_metadata: doc.server.moa_expose_metadata,
     };
 
     Ok(RuntimeConfig {

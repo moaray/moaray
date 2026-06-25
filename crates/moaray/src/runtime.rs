@@ -16,12 +16,15 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use moaray_config::RuntimeConfig;
 use moaray_core::provider::Provider;
+use moaray_moa::{MapResolver, Orchestrator};
 
 /// Hot-swappable, config-derived runtime data.
 pub struct Runtime {
     pub config: RuntimeConfig,
     /// model name -> provider instance.
     pub providers: HashMap<String, Arc<dyn Provider>>,
+    /// MoA orchestrator, sharing the same provider instances as passthrough.
+    pub orchestrator: Orchestrator<MapResolver>,
 }
 
 impl Runtime {

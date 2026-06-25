@@ -36,6 +36,10 @@ pub struct ServerDoc {
     /// Default max_tokens injected for upstreams that require it (anthropic).
     #[serde(default = "default_max_tokens")]
     pub default_max_tokens: u32,
+    /// Emit the optional `moaray` extension field with per-arm MoA metadata in
+    /// responses. **Off by default** (production posture); enable for debugging.
+    #[serde(default)]
+    pub moa_expose_metadata: bool,
 }
 
 impl Default for ServerDoc {
@@ -47,6 +51,7 @@ impl Default for ServerDoc {
             max_body_bytes: default_max_body_bytes(),
             shutdown_grace_ms: default_shutdown_grace_ms(),
             default_max_tokens: default_max_tokens(),
+            moa_expose_metadata: false,
         }
     }
 }

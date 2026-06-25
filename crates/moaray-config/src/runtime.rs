@@ -35,6 +35,9 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     pub shutdown_grace_ms: u64,
     pub default_max_tokens: u32,
+    /// Whether to emit the optional `moaray` MoA debug extension field. Off by
+    /// default (production posture).
+    pub moa_expose_metadata: bool,
 }
 
 /// How a key's secret is verified.

@@ -80,6 +80,8 @@ recipes:
         let cfg = load_yaml_with_env(VALID, &env()).expect("valid");
         assert_eq!(cfg.server.port, 9090);
         assert_eq!(cfg.server.max_body_bytes, 2048);
+        // MoA debug extension field defaults OFF (production posture)
+        assert!(!cfg.server.moa_expose_metadata);
         // base_url trailing slash trimmed
         assert_eq!(cfg.models["opus"].base_url, "https://api.anthropic.com");
         assert_eq!(cfg.models["gpt"].upstream_id, "gpt");

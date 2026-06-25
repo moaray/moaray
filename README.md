@@ -57,7 +57,8 @@ cargo clippy --workspace -- -D warnings
 
 ## Status
 
-🚧 Early. Phase 1 (passthrough MVP) implemented; MoA orchestration (Phase 2) and
+🚧 Early. Phase 1 (passthrough MVP) and Phase 2 (MoA orchestration —
+fan-out + concat-synthesize / quorum-judge + quorum tolerance) implemented;
 production hardening (Phase 3) in progress. See `DESIGN.md` for the full spec.
 
 ## License
