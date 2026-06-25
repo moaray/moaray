@@ -118,6 +118,62 @@ models:
         assert!(matches!(reject(y), ConfigError::DuplicateModel(_)));
     }
 
+    /// P2 (rework R2): two models sharing one `upstream_id` with divergent
+    /// `rate_limit` must be rejected at validation — otherwise `reconcile` keeps
+    /// the first-by-name model's limit and silently drops the other, so renaming
+    /// a model could weaken/disable the safety limit (order-dependent governance).
+    #[test]
+    fn rejects_conflicting_shared_upstream_rate_limit() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 1, burst: 1}}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 100, burst: 200}}
+"#;
+        assert!(matches!(
+            reject(y),
+            ConfigError::ConflictingUpstreamGovernance {
+                field: "rate_limit",
+                ..
+            }
+        ));
+    }
+
+    /// P2 sibling: divergent `max_concurrency` on a shared `upstream_id` is also
+    /// rejected (same silent-drop hazard).
+    #[test]
+    fn rejects_conflicting_shared_upstream_max_concurrency() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, max_concurrency: 1}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, max_concurrency: 64}
+"#;
+        assert!(matches!(
+            reject(y),
+            ConfigError::ConflictingUpstreamGovernance {
+                field: "max_concurrency",
+                ..
+            }
+        ));
+    }
+
+    /// Two models may still share an `upstream_id` when their per-upstream
+    /// governance is identical — that is the legitimate MoA/passthrough sharing
+    /// case and must stay accepted (order-independent).
+    #[test]
+    fn accepts_shared_upstream_with_identical_governance() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("identical shared governance is valid");
+        assert_eq!(cfg.models["m1"].upstream_id, "shared");
+        assert_eq!(cfg.models["m2"].upstream_id, "shared");
+    }
+
     #[test]
     fn allowlist_may_reference_an_unconfigured_model() {
         // The allowlist is authorization policy, decoupled from the model

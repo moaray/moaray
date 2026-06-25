@@ -27,6 +27,7 @@ use moaray_core::provider::{ByteStream, Provider, RawResponse, ReqCtx};
 use moaray_core::types::{ChatRequest, ChatResponse};
 use tokio::sync::OwnedSemaphorePermit;
 
+use crate::breaker::Admission;
 use crate::runtime::UpstreamState;
 
 /// A provider wrapped with per-upstream breaker + limiter + concurrency + retry.
@@ -46,8 +47,10 @@ impl GovernedProvider {
         }
     }
 
-    /// Run the breaker + limiter admission checks. Returns a held concurrency
-    /// permit (or `None` when unbounded) once admitted.
+    /// Run the breaker + limiter admission checks. Returns the breaker
+    /// [`Admission`] token (which the [`BreakerGuard`] must carry so a Closed-era
+    /// completion can never be mistaken for the half-open probe) together with a
+    /// held concurrency permit (or `None` when unbounded) once admitted.
     ///
     /// The breaker check may reserve the single half-open probe slot. That slot
     /// must be released if the request never reaches the upstream — whether a
@@ -56,19 +59,22 @@ impl GovernedProvider {
     /// covers the whole post-check window and is disarmed only once admission
     /// fully succeeds (at which point the caller's [`BreakerGuard`] takes over the
     /// probe's lifecycle).
-    async fn admit(&self) -> Result<Option<OwnedSemaphorePermit>> {
+    async fn admit(&self) -> Result<(Admission, Option<OwnedSemaphorePermit>)> {
         // 1. circuit breaker — fail fast if open (may reserve a half-open probe).
-        self.state.breaker.check()?;
+        let admission = self.state.breaker.check()?;
         // From here on, a reserved probe is released on any early exit (error or
-        // cancellation) until admission fully succeeds.
-        let mut probe_guard = ProbeReleaseGuard::new(self.state.clone());
+        // cancellation) until admission fully succeeds. Only a Probe admission
+        // actually reserved the slot; a Normal admission reserved nothing, so its
+        // guard must be inert — otherwise a cancelled Normal call could release a
+        // *different* in-flight probe's slot once the breaker has gone half-open.
+        let mut probe_guard = ProbeReleaseGuard::new(self.state.clone(), admission);
         // 2. per-upstream token bucket.
         self.state.check_limit()?;
         // 3. concurrency cap (permit released on drop / cancellation).
         let permit = self.state.concurrency.acquire().await?;
         // Admitted: the BreakerGuard now owns the probe's outcome.
         probe_guard.disarm();
-        Ok(permit)
+        Ok((admission, permit))
     }
 
     /// Number of additional attempts permitted for a retry-safe, non-stream call.
@@ -88,14 +94,25 @@ impl GovernedProvider {
 /// fails or the future is cancelled in that window, `Drop` frees the slot so the
 /// breaker can probe again; once admitted, the guard is disarmed and the call's
 /// [`BreakerGuard`] owns the outcome.
+///
+/// Only a [`Admission::Probe`] admission actually reserved the single probe slot,
+/// so the guard is inert for a [`Admission::Normal`] admission. Without this, a
+/// cancelled Normal call could call `release_probe()` and clear a *different*
+/// call's in-flight probe slot once the breaker had transitioned to half-open —
+/// reintroducing the very race the admission token fixes.
 struct ProbeReleaseGuard {
     state: Arc<UpstreamState>,
+    /// Armed only when this admission reserved the probe slot (Probe) and the
+    /// call has not yet been fully admitted.
     armed: bool,
 }
 
 impl ProbeReleaseGuard {
-    fn new(state: Arc<UpstreamState>) -> Self {
-        Self { state, armed: true }
+    fn new(state: Arc<UpstreamState>, admission: Admission) -> Self {
+        Self {
+            state,
+            armed: admission == Admission::Probe,
+        }
     }
 
     fn disarm(&mut self) {
@@ -134,15 +151,23 @@ enum BreakerAction {
 /// [`Error::UpstreamTimeout`] so repeated stalls never trip the breaker. The
 /// guard's `Drop` treats an un-finalized call as a failure, which both counts the
 /// stall and releases the probe (`on_failure` clears the flag).
+///
+/// The guard carries the [`Admission`] token from [`GovernedProvider::admit`] so
+/// the outcome is attributed to the admission this call was granted: only a
+/// `Probe`-admitted call drives half-open recovery. A `Normal` call that
+/// finishes after the breaker has since gone half-open is a no-op on the probe
+/// machinery — the fix for the half-open probe race.
 struct BreakerGuard {
     state: Arc<UpstreamState>,
+    admission: Admission,
     action: Option<BreakerAction>,
 }
 
 impl BreakerGuard {
-    fn new(state: Arc<UpstreamState>) -> Self {
+    fn new(state: Arc<UpstreamState>, admission: Admission) -> Self {
         Self {
             state,
+            admission,
             action: None,
         }
     }
@@ -165,10 +190,10 @@ impl BreakerGuard {
 impl Drop for BreakerGuard {
     fn drop(&mut self) {
         match self.action {
-            Some(BreakerAction::Success) => self.state.breaker.on_success(),
+            Some(BreakerAction::Success) => self.state.breaker.on_success(self.admission),
             // Explicit failure OR an un-finalized (cancelled/timed-out) call: count
             // it against the breaker and release any reserved half-open probe.
-            Some(BreakerAction::Failure) | None => self.state.breaker.on_failure(),
+            Some(BreakerAction::Failure) | None => self.state.breaker.on_failure(self.admission),
         }
     }
 }
@@ -180,9 +205,9 @@ impl Provider for GovernedProvider {
     }
 
     async fn passthrough(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
-        let _permit = self.admit().await?;
+        let (admission, _permit) = self.admit().await?;
         // Records exactly one breaker outcome on finalize OR on cancellation.
-        let mut guard = BreakerGuard::new(self.state.clone());
+        let mut guard = BreakerGuard::new(self.state.clone(), admission);
         let mut attempt = 0;
         loop {
             let result = self.inner.passthrough(ctx, raw_body.clone()).await;
@@ -211,14 +236,28 @@ impl Provider for GovernedProvider {
     }
 
     async fn passthrough_stream(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
-        let permit = self.admit().await?;
+        let (admission, permit) = self.admit().await?;
         // Records exactly one breaker outcome on the connect/handshake result OR
         // on cancellation before it completes.
-        let mut guard = BreakerGuard::new(self.state.clone());
+        let mut guard = BreakerGuard::new(self.state.clone(), admission);
         // Streaming is NEVER retried (a partially-streamed generation cannot be
         // safely replayed — plan P3-2).
         match self.inner.passthrough_stream(ctx, raw_body).await {
             Ok(resp) => {
+                // Deliberate: the breaker outcome for a stream is the *handshake*
+                // result (upstream reachable + accepted the request + began
+                // responding), not the body's eventual completion. This is the
+                // SAME accounting model the Closed-state streaming path uses — the
+                // breaker never observes mid-stream body errors for any streaming
+                // call (a passthrough body is relayed chunk-by-chunk, and a
+                // client disconnect is not an upstream-health fault). For a
+                // half-open probe this means a successful handshake closes the
+                // breaker rather than pinning the single probe slot for the whole
+                // stream lifetime; pinning it would fail-fast every other caller
+                // for the entire (possibly long) stream of a healthy, recovering
+                // upstream — a worse availability posture than admitting traffic
+                // as soon as reachability is proven. See the PR discussion for the
+                // tradeoff.
                 guard.success();
                 // Hold the concurrency permit for the lifetime of the stream so
                 // the cap reflects truly in-flight upstream work, not just the
@@ -233,8 +272,8 @@ impl Provider for GovernedProvider {
     }
 
     async fn chat(&self, ctx: &ReqCtx, req: ChatRequest) -> Result<ChatResponse> {
-        let _permit = self.admit().await?;
-        let mut guard = BreakerGuard::new(self.state.clone());
+        let (admission, _permit) = self.admit().await?;
+        let mut guard = BreakerGuard::new(self.state.clone(), admission);
         let mut attempt = 0;
         loop {
             match self.inner.chat(ctx, req.clone()).await {
@@ -467,7 +506,7 @@ mod tests {
             }),
         });
         // Trip the breaker.
-        st.breaker.on_failure();
+        st.breaker.on_failure(Admission::Normal);
         let g = GovernedProvider::new(inner.clone(), st, retry_off());
         assert!(matches!(
             g.passthrough(&ctx(), Bytes::new()).await,
@@ -623,7 +662,7 @@ mod tests {
             }),
         });
         // Trip the breaker open.
-        st.breaker.on_failure();
+        st.breaker.on_failure(Admission::Normal);
         let g = GovernedProvider::new(inner, st.clone(), retry_off());
 
         // First admitted call after cooldown becomes the half-open probe, then is
@@ -639,6 +678,54 @@ mod tests {
         assert!(
             st.breaker.check().is_ok(),
             "a new probe must be admittable after a cancelled probe"
+        );
+    }
+
+    /// Codex P1 (rework R2): a `Normal`-admitted call reserved NO probe slot, so
+    /// its `ProbeReleaseGuard` must be inert. If a Normal call is cancelled while a
+    /// *different* call's real half-open probe is in flight, dropping its guard
+    /// must NOT call `release_probe()` and free that probe's slot — doing so would
+    /// re-admit a second probe while the first is still outstanding, reintroducing
+    /// the half-open race the admission token closes.
+    #[test]
+    fn normal_admission_probe_guard_is_inert_and_does_not_release_a_real_probe() {
+        let st = Arc::new(UpstreamState {
+            limiter: None,
+            concurrency: crate::limit::Concurrency::new(None),
+            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 1,
+                open_ms: 0, // cooldown immediately elapsed -> next check probes
+                half_open_successes: 1,
+            }),
+        });
+        // Trip open, then admit the single real probe (breaker -> half-open,
+        // probe_in_flight = true).
+        st.breaker.on_failure(Admission::Normal);
+        let probe = st.breaker.check().expect("probe admitted after cooldown");
+        assert_eq!(probe, Admission::Probe);
+        assert_eq!(st.breaker.state(), crate::breaker::BreakerState::HalfOpen);
+        // A concurrent caller is rejected — the probe slot is held.
+        assert!(matches!(st.breaker.check(), Err(Error::CircuitOpen)));
+
+        // Now a Normal-admission guard (modelling a Closed-era call still parked
+        // on a later gate) is dropped mid-flight. It must be inert.
+        {
+            let _g = ProbeReleaseGuard::new(st.clone(), Admission::Normal);
+            // dropped here
+        }
+        // The real probe's slot must still be held: no second probe admitted.
+        assert!(
+            matches!(st.breaker.check(), Err(Error::CircuitOpen)),
+            "a Normal admission's guard must not release the in-flight probe slot"
+        );
+
+        // Sanity: a genuine Probe-admission guard IS armed and frees the slot.
+        {
+            let _g = ProbeReleaseGuard::new(st.clone(), probe);
+        }
+        assert!(
+            st.breaker.check().is_ok(),
+            "a Probe admission's guard must release the slot on drop"
         );
     }
 

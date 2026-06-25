@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the reload-surviving stateful layer FIRST so the provider registry
     // can be wrapped against the same per-upstream slots the handlers read.
     let stateful = Arc::new(StatefulState::from_config(&config));
-    let providers = registry::build_providers(&config, &stateful);
+    let providers = registry::build_providers(&config, &stateful)?;
     let orchestrator = registry::build_orchestrator(&config, &providers);
     let runtime = Runtime {
         config,

@@ -97,6 +97,42 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
     }
     let known: BTreeSet<&String> = models.keys().collect();
 
+    // Per-upstream governance consistency: several models may share one
+    // `upstream_id` and then share a single token bucket / concurrency semaphore
+    // / breaker (`StatefulState` keys per upstream_id). If they declare
+    // *divergent* `rate_limit` / `max_concurrency`, `reconcile` keeps the first
+    // model by name and silently drops the rest — so renaming a model could
+    // weaken or disable a safety limit. Reject the ambiguity fail-fast at startup
+    // instead of resolving it order-dependently.
+    {
+        let mut seen: BTreeMap<&str, &ModelConfig> = BTreeMap::new();
+        for m in models.values() {
+            match seen.get(m.upstream_id.as_str()) {
+                None => {
+                    seen.insert(m.upstream_id.as_str(), m);
+                }
+                Some(first) => {
+                    if first.rate_limit != m.rate_limit {
+                        return Err(ConfigError::ConflictingUpstreamGovernance {
+                            upstream_id: m.upstream_id.clone(),
+                            first: first.name.clone(),
+                            second: m.name.clone(),
+                            field: "rate_limit",
+                        });
+                    }
+                    if first.max_concurrency != m.max_concurrency {
+                        return Err(ConfigError::ConflictingUpstreamGovernance {
+                            upstream_id: m.upstream_id.clone(),
+                            first: first.name.clone(),
+                            second: m.name.clone(),
+                            field: "max_concurrency",
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // keys — exactly one secret shape, non-empty allowlist, known models.
     let mut keys = Vec::new();
     for k in doc.auth.keys {

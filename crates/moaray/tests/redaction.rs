@@ -88,7 +88,7 @@ models:
     let max_body_bytes = config.server.max_body_bytes;
     let moa_expose_metadata = config.server.moa_expose_metadata;
     let stateful = std::sync::Arc::new(StatefulState::from_config(&config));
-    let providers = registry::build_providers(&config, &stateful);
+    let providers = registry::build_providers(&config, &stateful).expect("providers build");
     let orchestrator = registry::build_orchestrator(&config, &providers);
     let runtime = Runtime {
         config,
