@@ -18,10 +18,49 @@ model: "moa/<recipe>" -> orchestration (fan-out + aggregate)
 
 Today's open-source LLM gateways all do routing + failover. None do **parallel fan-out + aggregation + quality judging**. `moaray` fills that gap — drop-in replace your gateway, and unlock a quality-boosting MoA mode on top.
 
+## Quickstart (Docker Compose)
+
+Phase 1 ships the passthrough gateway with a self-contained mock upstream, so
+you can try it end-to-end with no real API keys:
+
+```bash
+# build + start moaray and the bundled mock-upstream
+docker compose up --build
+
+# health check
+curl -s http://localhost:8080/healthz          # -> ok
+
+# passthrough chat completion (auth via the inbound bearer key from compose)
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-local-dev" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock-gpt","messages":[{"role":"user","content":"hi"}]}'
+
+# streaming (SSE) — frames relayed end-to-end
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-local-dev" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock-gpt","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+`config.example.yaml` is the reference config — secrets are referenced by env
+var, never inlined. Point moaray at your own upstreams by adding entries under
+`models:` and the matching `api_key_env` environment variables.
+
+## Build & test (local)
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+```
+
 ## Status
 
-🚧 Early. Spec & MVP in progress.
+🚧 Early. Phase 1 (passthrough MVP) implemented; MoA orchestration (Phase 2) and
+production hardening (Phase 3) in progress. See `DESIGN.md` for the full spec.
 
 ## License
 
-TBD
+Apache-2.0
+

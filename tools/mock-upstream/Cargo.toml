@@ -1,0 +1,15 @@
+[package]
+name = "mock-upstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mock-upstream"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+serde_json.workspace = true
