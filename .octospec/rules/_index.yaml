@@ -1,0 +1,36 @@
+# Rule index for this repo's .octospec/rules/
+# Mirrors the frontmatter of each rule file so tooling can resolve injection
+# without parsing every file.
+#
+# Resolution semantics:
+#   - id must be globally unique (including inherited global rules).
+#   - a repo-tier rule with the same id overrides the global one.
+#   - inject_when = paths glob OR touches tag (union); a rule is injected once.
+#   - when the injection budget is exceeded, keep load_bearing first, then by
+#     priority (desc); truncated low-priority rules inject only their summary line.
+
+rules:
+  - id: no-secret-logging
+    priority: 95
+    load_bearing: true
+    inject_when:
+      paths: ["**/*.rs"]
+      touches: ["auth", "provider", "logging", "config"]
+  - id: moa-partial-failure
+    priority: 90
+    load_bearing: true
+    inject_when:
+      paths: ["**/moa*.rs", "**/orchestrat*.rs", "**/aggregat*.rs"]
+      touches: ["moa", "orchestration", "quorum"]
+  - id: streaming-passthrough
+    priority: 85
+    load_bearing: true
+    inject_when:
+      paths: ["**/passthrough*.rs", "**/provider*.rs", "**/stream*.rs", "**/handler*.rs"]
+      touches: ["streaming", "passthrough"]
+  - id: error-envelope
+    priority: 80
+    load_bearing: true
+    inject_when:
+      paths: ["**/handler*.rs", "**/http*.rs", "**/api*.rs", "**/error*.rs"]
+      touches: ["error-response", "api"]
