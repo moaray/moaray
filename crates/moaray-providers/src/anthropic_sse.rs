@@ -27,17 +27,24 @@ struct SseEvent {
 /// Incremental SSE parser: feed bytes, get back complete events.
 #[derive(Default)]
 struct SseParser {
-    buf: String,
+    /// Raw byte buffer. We decode UTF-8 only on complete lines, so a multibyte
+    /// character split across network chunks is never mis-decoded.
+    buf: Vec<u8>,
     cur: SseEvent,
 }
 
 impl SseParser {
-    fn push(&mut self, chunk: &str, out: &mut Vec<SseEvent>) {
-        self.buf.push_str(chunk);
+    fn push(&mut self, chunk: &[u8], out: &mut Vec<SseEvent>) {
+        self.buf.extend_from_slice(chunk);
         // Process complete lines; keep any trailing partial line in buf.
-        while let Some(nl) = self.buf.find('\n') {
-            let line = self.buf[..nl].trim_end_matches('\r').to_string();
-            self.buf.drain(..=nl);
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let mut raw: Vec<u8> = self.buf.drain(..=nl).collect();
+            raw.pop(); // drop the '\n'
+            if raw.last() == Some(&b'\r') {
+                raw.pop();
+            }
+            // A complete line is a valid UTF-8 boundary; lossy is a safety net.
+            let line = String::from_utf8_lossy(&raw).into_owned();
             if line.is_empty() {
                 // dispatch the event if it has any data/type
                 if self.cur.event.is_some() || !self.cur.data.is_empty() {
@@ -76,12 +83,8 @@ where
                 Ok(b) => b,
                 Err(e) => { yield Err(e); return; }
             };
-            let text = match std::str::from_utf8(&bytes) {
-                Ok(t) => t.to_string(),
-                Err(_) => { yield Err(Error::UpstreamError); return; }
-            };
             let mut events = Vec::new();
-            parser.push(&text, &mut events);
+            parser.push(&bytes, &mut events);
             for ev in events {
                 let data = ev.data.trim();
                 if data.is_empty() { continue; }
@@ -219,6 +222,22 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let s = stream::iter(parts);
         let out = collect(translate(s, "c".into())).await;
         assert!(out.contains("hi"));
+        assert!(out.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn multibyte_utf8_split_across_chunks_is_preserved() {
+        // Chinese text is multibyte UTF-8; split the delta line mid-character so
+        // a naive per-chunk from_utf8 would fail.
+        let full = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\u{4f60}\u{597d}\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let bytes = full.as_bytes().to_vec();
+        let mid = bytes.len() / 2;
+        let (a, b) = bytes.split_at(mid);
+        let parts = vec![Ok(Bytes::from(a.to_vec())), Ok(Bytes::from(b.to_vec()))];
+        let s = stream::iter(parts);
+        let out = collect(translate(s, "c".into())).await;
+        assert!(out.contains('\u{4f60}'), "out: {out}");
+        assert!(out.contains('\u{597d}'), "out: {out}");
         assert!(out.contains("[DONE]"));
     }
 

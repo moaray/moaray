@@ -131,15 +131,17 @@ async fn chat_completions(
     )?
     .to_string();
 
-    // Read the body (bounded by DefaultBodyLimit; over-limit yields 413 below).
+    // Authenticate BEFORE touching the body so an invalid key fails closed with
+    // 401 rather than doing body work / returning 413 for an oversized payload.
+    let rt = ctx.state.runtime();
+    let auth = authenticate(&rt.config.keys, &token)?;
+
+    // Read the body (bounded by DefaultBodyLimit; over-limit yields 413).
     let body = req.into_body();
     let raw = match axum::body::to_bytes(body, ctx.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => return Err(Error::PayloadTooLarge.into()),
     };
-
-    let rt = ctx.state.runtime();
-    let auth = authenticate(&rt.config.keys, &token)?;
 
     // Parse just enough to learn the model + stream flag (without losing data).
     let parsed: Value = serde_json::from_slice(&raw)
@@ -180,10 +182,20 @@ async fn chat_completions(
     };
 
     let raw_body = Bytes::from(raw.to_vec());
-    let result = if stream {
-        provider.passthrough_stream(&rctx, raw_body).await
-    } else {
-        provider.passthrough(&rctx, raw_body).await
+    // Enforce the configured per-request timeout around the upstream call so a
+    // stalled upstream surfaces as 504 upstream_timeout. For streaming this
+    // bounds time-to-first-response (headers/connect); the relayed body stream
+    // then flows under client backpressure.
+    let call = async {
+        if stream {
+            provider.passthrough_stream(&rctx, raw_body).await
+        } else {
+            provider.passthrough(&rctx, raw_body).await
+        }
+    };
+    let result = match tokio::time::timeout(ctx.request_timeout, call).await {
+        Ok(r) => r,
+        Err(_) => Err(Error::UpstreamTimeout),
     };
 
     match result {

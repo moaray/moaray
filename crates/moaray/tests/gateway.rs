@@ -283,6 +283,30 @@ async fn oversized_body_returns_413() {
 }
 
 #[tokio::test]
+async fn oversized_body_without_auth_returns_401_not_413() {
+    // Auth must fail closed before the body is read: an oversized but
+    // unauthenticated request is 401, not 413.
+    set_keys();
+    let server = MockServer::start().await;
+    let app = app_from_yaml(&cfg_yaml(&server.uri(), 64));
+    let big = format!(
+        r#"{{"model":"gpt","messages":[],"pad":"{}"}}"#,
+        "x".repeat(500)
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .body(Body::from(big))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn metrics_endpoint_serves_prometheus_text() {
     set_keys();
     let server = MockServer::start().await;
