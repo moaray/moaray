@@ -113,3 +113,50 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     // at least two delta frames
     assert!(out.matches("\"delta\"").count() >= 2);
 }
+
+#[tokio::test]
+async fn forwards_request_id_to_upstream() {
+    let server = MockServer::start().await;
+    // Match only when the correlation header carries ctx.request_id ("req").
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-request-id", "req"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_1",
+            "content": [{"type":"text","text":"ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("claude", server.uri(), "k", 4096, build_client());
+    let raw = br#"{"model":"claude","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = provider
+        .passthrough(&ctx(), Bytes::from_static(raw))
+        .await
+        .expect("request-id forwarded");
+    assert_eq!(resp.status, 200);
+}
+
+#[tokio::test]
+async fn passthrough_preserves_non_200_2xx_status() {
+    let server = MockServer::start().await;
+    // A 206 is a success the gateway must relay verbatim, not flatten to 200.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(206).set_body_json(serde_json::json!({
+            "id": "msg_1",
+            "content": [{"type":"text","text":"ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("claude", server.uri(), "k", 4096, build_client());
+    let raw = br#"{"model":"claude","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = provider
+        .passthrough(&ctx(), Bytes::from_static(raw))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, 206);
+}

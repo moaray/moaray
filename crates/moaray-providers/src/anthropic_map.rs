@@ -19,6 +19,21 @@ pub fn openai_to_anthropic(req: &Value, default_max_tokens: u32) -> Result<Value
         .and_then(Value::as_str)
         .ok_or_else(|| Error::BadRequest("missing model".into()))?;
 
+    // v1 is text-only. Tool calling / structured-output controls cannot be
+    // faithfully mapped to the Anthropic text path, so STOP with a clean
+    // `unsupported` error rather than silently dropping them and downgrading a
+    // tool request to plain text. (Mirrors the response-side guard in
+    // `anthropic_to_openai`.)
+    for field in ["tools", "tool_choice", "response_format"] {
+        if let Some(v) = req.get(field) {
+            if !v.is_null() {
+                return Err(Error::Unsupported(format!(
+                    "`{field}` is not supported in v1 (text-only)"
+                )));
+            }
+        }
+    }
+
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
 
@@ -237,5 +252,53 @@ mod tests {
         let resp = json!({"content":[{"type":"tool_use","id":"t","name":"f"}]});
         let err = anthropic_to_openai(&resp, "c").unwrap_err();
         assert_eq!(err.envelope().code, "unsupported");
+    }
+
+    #[test]
+    fn request_tools_are_unsupported() {
+        let req = json!({
+            "model": "claude-x",
+            "messages": [{"role":"user","content":"hi"}],
+            "tools": [{"type":"function","function":{"name":"get_weather"}}]
+        });
+        let err = openai_to_anthropic(&req, 4096).unwrap_err();
+        assert_eq!(err.envelope().code, "unsupported");
+    }
+
+    #[test]
+    fn request_tool_choice_is_unsupported() {
+        let req = json!({
+            "model": "claude-x",
+            "messages": [{"role":"user","content":"hi"}],
+            "tool_choice": "auto"
+        });
+        let err = openai_to_anthropic(&req, 4096).unwrap_err();
+        assert_eq!(err.envelope().code, "unsupported");
+    }
+
+    #[test]
+    fn request_response_format_is_unsupported() {
+        let req = json!({
+            "model": "claude-x",
+            "messages": [{"role":"user","content":"hi"}],
+            "response_format": {"type":"json_object"}
+        });
+        let err = openai_to_anthropic(&req, 4096).unwrap_err();
+        assert_eq!(err.envelope().code, "unsupported");
+    }
+
+    #[test]
+    fn request_with_null_tool_fields_is_allowed() {
+        // Explicit JSON nulls are the OpenAI default for "unset" and must not
+        // trip the guard — only present, non-null tool controls STOP.
+        let req = json!({
+            "model": "claude-x",
+            "messages": [{"role":"user","content":"hi"}],
+            "tools": null,
+            "tool_choice": null,
+            "response_format": null
+        });
+        let out = openai_to_anthropic(&req, 4096).unwrap();
+        assert_eq!(out["model"], json!("claude-x"));
     }
 }

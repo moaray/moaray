@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::anthropic_map::{anthropic_to_openai, openai_to_anthropic, ANTHROPIC_VERSION};
 use crate::anthropic_sse::translate;
-use crate::common::{map_reqwest_error, map_upstream_status};
+use crate::common::{map_reqwest_error, map_upstream_status, REQUEST_ID_HEADER};
 
 /// An Anthropic Messages upstream.
 pub struct AnthropicProvider {
@@ -71,12 +71,13 @@ impl AnthropicProvider {
         Ok((model, anthropic))
     }
 
-    async fn send(&self, body: &Value) -> Result<reqwest::Response> {
+    async fn send(&self, ctx: &ReqCtx, body: &Value) -> Result<reqwest::Response> {
         self.client
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(REQUEST_ID_HEADER, &ctx.request_id)
             .json(body)
             .send()
             .await
@@ -90,10 +91,11 @@ impl Provider for AnthropicProvider {
         &self.upstream_id
     }
 
-    async fn passthrough(&self, _ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
+    async fn passthrough(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
         let (model, body) = self.build_body(&raw_body, false)?;
-        let resp = self.send(&body).await?;
-        map_upstream_status(resp.status().as_u16())?;
+        let resp = self.send(ctx, &body).await?;
+        let status = resp.status().as_u16();
+        map_upstream_status(status)?;
         let bytes = resp.bytes().await.map_err(|e| map_reqwest_error(&e))?;
         let anthropic: Value = serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamError)?;
         let openai = anthropic_to_openai(&anthropic, &model)?;
@@ -102,16 +104,17 @@ impl Provider for AnthropicProvider {
             async move { Ok(Bytes::from(out)) },
         ));
         Ok(RawResponse {
-            status: 200,
+            status,
             content_type: Some("application/json".to_string()),
             body,
         })
     }
 
-    async fn passthrough_stream(&self, _ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
+    async fn passthrough_stream(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
         let (model, body) = self.build_body(&raw_body, true)?;
-        let resp = self.send(&body).await?;
-        map_upstream_status(resp.status().as_u16())?;
+        let resp = self.send(ctx, &body).await?;
+        let status = resp.status().as_u16();
+        map_upstream_status(status)?;
         let upstream = resp.bytes_stream().map(|item| {
             item.map_err(|e| {
                 if e.is_timeout() {
@@ -123,18 +126,18 @@ impl Provider for AnthropicProvider {
         });
         let translated = translate(upstream, model);
         Ok(RawResponse {
-            status: 200,
+            status,
             content_type: Some("text/event-stream".to_string()),
             body: Box::pin(translated),
         })
     }
 
-    async fn chat(&self, _ctx: &ReqCtx, req: ChatRequest) -> Result<ChatResponse> {
+    async fn chat(&self, ctx: &ReqCtx, req: ChatRequest) -> Result<ChatResponse> {
         let openai = serde_json::to_value(&req).map_err(|_| Error::Internal)?;
         let model = req.model.clone();
         let mut body = openai_to_anthropic(&openai, self.default_max_tokens)?;
         body["stream"] = Value::Bool(false);
-        let resp = self.send(&body).await?;
+        let resp = self.send(ctx, &body).await?;
         map_upstream_status(resp.status().as_u16())?;
         let bytes = resp.bytes().await.map_err(|e| map_reqwest_error(&e))?;
         let anthropic: Value = serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamError)?;

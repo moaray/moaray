@@ -7,7 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   build-test:
@@ -25,16 +24,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy (deny warnings)
+        # deny-warnings semantics live here (clippy-driver wraps rustc, so this
+        # catches rustc warnings too across all targets). Kept off the global env
+        # so build/test don't recompile under a different fingerprint.
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
       - name: No litellm dependency
         run: |
-          if cargo tree --workspace 2>/dev/null | grep -qi litellm; then
+          # Capture output AND exit code first: a broken manifest makes
+          # `cargo tree` fail with no stdout, which previously slipped past the
+          # grep and printed OK (fail-open). Fail the gate on any cargo error.
+          set -o pipefail
+          if ! tree_out=$(cargo tree --workspace 2>&1); then
+            echo "FAIL: cargo tree errored — cannot verify clean-room requirement"
+            echo "$tree_out"
+            exit 1
+          fi
+          if printf '%s\n' "$tree_out" | grep -qi litellm; then
             echo "FAIL: litellm found in dependency tree (clean-room requirement)"; exit 1
           fi
           echo "OK: no litellm dependency"

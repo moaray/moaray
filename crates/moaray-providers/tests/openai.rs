@@ -119,3 +119,22 @@ async fn upstream_5xx_maps_to_upstream_error() {
         .unwrap_err();
     assert_eq!(err.envelope().status, 502);
 }
+
+#[tokio::test]
+async fn passthrough_forwards_request_id_to_upstream() {
+    let server = MockServer::start().await;
+    // The mock only matches when the correlation header carries ctx.request_id,
+    // so a missing/dropped x-request-id would yield a 404 and fail the call.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-request-id", "req-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"))
+        .mount(&server)
+        .await;
+    let provider = OpenAiProvider::new("gpt", server.uri(), "k", build_client());
+    let resp = provider
+        .passthrough(&ctx(), Bytes::from_static(b"{\"model\":\"gpt\"}"))
+        .await
+        .expect("request-id forwarded");
+    assert_eq!(resp.status, 200);
+}

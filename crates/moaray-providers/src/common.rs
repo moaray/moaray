@@ -5,6 +5,10 @@ use futures_util::StreamExt;
 use moaray_core::error::Error;
 use moaray_core::provider::{ByteStream, RawResponse};
 
+/// Correlation header forwarded to every upstream so the request id minted by
+/// the gateway (see `moaray::app`) is propagated end-to-end (DESIGN P1-6).
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
 /// Map an upstream HTTP status into the canonical error matrix. `Ok(())` means
 /// the status is a success the caller should relay as-is.
 pub fn map_upstream_status(status: u16) -> Result<(), Error> {

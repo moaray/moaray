@@ -15,7 +15,9 @@ use moaray_core::provider::{Provider, RawResponse, ReqCtx};
 use moaray_core::types::{ChatRequest, ChatResponse};
 use reqwest::Client;
 
-use crate::common::{collect_response, map_reqwest_error, map_upstream_status, stream_response};
+use crate::common::{
+    collect_response, map_reqwest_error, map_upstream_status, stream_response, REQUEST_ID_HEADER,
+};
 
 /// An OpenAI-compatible upstream.
 pub struct OpenAiProvider {
@@ -50,11 +52,12 @@ impl OpenAiProvider {
         )
     }
 
-    async fn send(&self, raw_body: Bytes) -> Result<reqwest::Response> {
+    async fn send(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<reqwest::Response> {
         self.client
             .post(self.endpoint())
             .bearer_auth(&self.api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(REQUEST_ID_HEADER, &ctx.request_id)
             .body(raw_body)
             .send()
             .await
@@ -68,8 +71,8 @@ impl Provider for OpenAiProvider {
         &self.upstream_id
     }
 
-    async fn passthrough(&self, _ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
-        let resp = self.send(raw_body).await?;
+    async fn passthrough(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
+        let resp = self.send(ctx, raw_body).await?;
         // Non-2xx maps to the canonical error matrix; the handler renders the
         // envelope. (We surface a typed error rather than relaying the upstream
         // error body to avoid leaking provider internals.)
@@ -77,17 +80,17 @@ impl Provider for OpenAiProvider {
         collect_response(resp).await
     }
 
-    async fn passthrough_stream(&self, _ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
-        let resp = self.send(raw_body).await?;
+    async fn passthrough_stream(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
+        let resp = self.send(ctx, raw_body).await?;
         map_upstream_status(resp.status().as_u16())?;
         // Relay the SSE byte stream frame-by-frame — no buffering.
         Ok(stream_response(resp))
     }
 
-    async fn chat(&self, _ctx: &ReqCtx, req: ChatRequest) -> Result<ChatResponse> {
+    async fn chat(&self, ctx: &ReqCtx, req: ChatRequest) -> Result<ChatResponse> {
         // Structured path: serialize the typed request, post, parse typed back.
         let body = serde_json::to_vec(&req).map_err(|_| Error::Internal)?;
-        let resp = self.send(Bytes::from(body)).await?;
+        let resp = self.send(ctx, Bytes::from(body)).await?;
         map_upstream_status(resp.status().as_u16())?;
         let bytes = resp.bytes().await.map_err(|e| map_reqwest_error(&e))?;
         serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamError)
