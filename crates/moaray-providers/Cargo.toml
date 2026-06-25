@@ -12,6 +12,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
+async-stream.workspace = true
 bytes.workspace = true
 futures.workspace = true
 futures-util.workspace = true
