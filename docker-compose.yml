@@ -1,0 +1,25 @@
+services:
+  mock-upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: moaray:latest
+    entrypoint: ["mock-upstream"]
+    environment:
+      PORT: "9000"
+    expose:
+      - "9000"
+
+  moaray:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: moaray:latest
+    depends_on:
+      - mock-upstream
+    environment:
+      MOARAY_CONFIG: /app/config.example.yaml
+      MOARAY_INBOUND_KEY: "sk-local-dev"
+      MOCK_UPSTREAM_KEY: "sk-mock-upstream"
+    ports:
+      - "8080:8080"

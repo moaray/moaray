@@ -1,0 +1,30 @@
+# moaray example config. Secrets are referenced by env var, never inlined.
+server:
+  bind: "0.0.0.0"
+  port: 8080
+  request_timeout_ms: 120000
+  max_body_bytes: 1048576      # 1 MiB inbound body cap
+  shutdown_grace_ms: 15000
+  default_max_tokens: 4096     # injected for anthropic when caller omits it
+
+auth:
+  keys:
+    - id: local-dev
+      key_env: MOARAY_INBOUND_KEY   # bearer token callers must present
+      allow_models: [mock-gpt]
+
+models:
+  - name: mock-gpt
+    provider_type: openai-compat
+    base_url: http://mock-upstream:9000   # docker-compose service
+    api_key_env: MOCK_UPSTREAM_KEY
+    upstream_id: mock-gpt
+
+# MoA recipes are parsed/validated in Phase 1 but activated in Phase 2.
+recipes:
+  arm-e:
+    proposers: [mock-gpt]
+    aggregator: mock-gpt
+    strategy: concat-synthesize
+    arm_timeout_ms: 60000
+    quorum: 1
