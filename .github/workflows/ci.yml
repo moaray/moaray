@@ -56,3 +56,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Docker build
         run: docker build -t moaray:ci .
+
+  octospec-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: octospec OKF lint
+        run: ./.octospec/scripts/octospec-lint.sh .
