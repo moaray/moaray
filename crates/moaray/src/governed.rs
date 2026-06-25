@@ -49,48 +49,26 @@ impl GovernedProvider {
     /// Run the breaker + limiter admission checks. Returns a held concurrency
     /// permit (or `None` when unbounded) once admitted.
     ///
-    /// The breaker check may reserve a single half-open probe slot; if a later
-    /// gate (rate limit / concurrency) then rejects the request, the reserved
-    /// probe is released so the breaker can probe again later (it never reached
-    /// the upstream, so it is neither a success nor a failure).
+    /// The breaker check may reserve the single half-open probe slot. That slot
+    /// must be released if the request never reaches the upstream — whether a
+    /// later gate (rate limit / concurrency) rejects it, **or** the future is
+    /// cancelled while waiting for a concurrency permit. A [`ProbeReleaseGuard`]
+    /// covers the whole post-check window and is disarmed only once admission
+    /// fully succeeds (at which point the caller's [`BreakerGuard`] takes over the
+    /// probe's lifecycle).
     async fn admit(&self) -> Result<Option<OwnedSemaphorePermit>> {
         // 1. circuit breaker — fail fast if open (may reserve a half-open probe).
         self.state.breaker.check()?;
+        // From here on, a reserved probe is released on any early exit (error or
+        // cancellation) until admission fully succeeds.
+        let mut probe_guard = ProbeReleaseGuard::new(self.state.clone());
         // 2. per-upstream token bucket.
-        if let Err(e) = self.state.check_limit() {
-            self.state.breaker.release_probe();
-            return Err(e);
-        }
+        self.state.check_limit()?;
         // 3. concurrency cap (permit released on drop / cancellation).
-        match self.state.concurrency.acquire().await {
-            Ok(permit) => Ok(permit),
-            Err(e) => {
-                self.state.breaker.release_probe();
-                Err(e)
-            }
-        }
-    }
-
-    /// Record a successful upstream outcome against the breaker.
-    fn record_success(&self) {
-        self.state.breaker.on_success();
-    }
-
-    /// Record a failed upstream outcome against the breaker.
-    ///
-    /// Only genuine upstream-health faults (5xx / timeout / connect) trip the
-    /// breaker; an upstream 4xx ([`Error::UpstreamClientError`]) or 429
-    /// ([`Error::UpstreamRateLimited`]) means the upstream is up and answering,
-    /// so it is reported as breaker-neutral (a *success* to the breaker) — this
-    /// keeps one caller's malformed requests or a single misconfigured key from
-    /// tripping the shared per-upstream breaker and fail-fasting every other
-    /// caller/model (see [`Error::counts_against_breaker`]).
-    fn record_error(&self, err: &Error) {
-        if err.counts_against_breaker() {
-            self.state.breaker.on_failure();
-        } else {
-            self.state.breaker.on_success();
-        }
+        let permit = self.state.concurrency.acquire().await?;
+        // Admitted: the BreakerGuard now owns the probe's outcome.
+        probe_guard.disarm();
+        Ok(permit)
     }
 
     /// Number of additional attempts permitted for a retry-safe, non-stream call.
@@ -103,6 +81,98 @@ impl GovernedProvider {
     }
 }
 
+/// Releases a reserved half-open probe slot on drop unless explicitly disarmed.
+///
+/// Used inside [`GovernedProvider::admit`] to cover the window between reserving
+/// the probe (the breaker `check`) and fully admitting the call. If admission
+/// fails or the future is cancelled in that window, `Drop` frees the slot so the
+/// breaker can probe again; once admitted, the guard is disarmed and the call's
+/// [`BreakerGuard`] owns the outcome.
+struct ProbeReleaseGuard {
+    state: Arc<UpstreamState>,
+    armed: bool,
+}
+
+impl ProbeReleaseGuard {
+    fn new(state: Arc<UpstreamState>) -> Self {
+        Self { state, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeReleaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.breaker.release_probe();
+        }
+    }
+}
+
+/// What a finished call should report to the breaker.
+#[derive(Clone, Copy)]
+enum BreakerAction {
+    /// Upstream answered (2xx) or answered with a breaker-neutral status
+    /// (4xx/429/redirect) — recovery progresses, the breaker does not trip.
+    Success,
+    /// A genuine upstream-health fault (5xx / timeout / connect) — counts toward
+    /// tripping the breaker.
+    Failure,
+}
+
+/// RAII guard that records exactly one breaker outcome for an admitted call,
+/// **including on cancellation**.
+///
+/// A call admitted past [`GovernedProvider::admit`] may also have reserved the
+/// single half-open probe slot. If the surrounding future is dropped before the
+/// call finalizes — e.g. the handler's `tokio::time::timeout` fires, or the
+/// client disconnects — neither the success nor the error path runs. Without
+/// this guard that would (a) leak `probe_in_flight=true` so the breaker could
+/// never probe again, and (b) silently swallow a gateway-level
+/// [`Error::UpstreamTimeout`] so repeated stalls never trip the breaker. The
+/// guard's `Drop` treats an un-finalized call as a failure, which both counts the
+/// stall and releases the probe (`on_failure` clears the flag).
+struct BreakerGuard {
+    state: Arc<UpstreamState>,
+    action: Option<BreakerAction>,
+}
+
+impl BreakerGuard {
+    fn new(state: Arc<UpstreamState>) -> Self {
+        Self {
+            state,
+            action: None,
+        }
+    }
+
+    /// Mark the call as a breaker success (set once; later finalize wins).
+    fn success(&mut self) {
+        self.action = Some(BreakerAction::Success);
+    }
+
+    /// Resolve an error into a breaker outcome (neutral errors report success).
+    fn record(&mut self, err: &Error) {
+        self.action = Some(if err.counts_against_breaker() {
+            BreakerAction::Failure
+        } else {
+            BreakerAction::Success
+        });
+    }
+}
+
+impl Drop for BreakerGuard {
+    fn drop(&mut self) {
+        match self.action {
+            Some(BreakerAction::Success) => self.state.breaker.on_success(),
+            // Explicit failure OR an un-finalized (cancelled/timed-out) call: count
+            // it against the breaker and release any reserved half-open probe.
+            Some(BreakerAction::Failure) | None => self.state.breaker.on_failure(),
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for GovernedProvider {
     fn upstream_id(&self) -> &str {
@@ -111,24 +181,29 @@ impl Provider for GovernedProvider {
 
     async fn passthrough(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
         let _permit = self.admit().await?;
+        // Records exactly one breaker outcome on finalize OR on cancellation.
+        let mut guard = BreakerGuard::new(self.state.clone());
         let mut attempt = 0;
         loop {
             let result = self.inner.passthrough(ctx, raw_body.clone()).await;
             match result {
                 Ok(resp) => {
-                    self.record_success();
+                    guard.success();
                     return Ok(resp);
                 }
                 Err(e) => {
-                    self.record_error(&e);
                     // Retry ONLY connect failures (request never sent), only when
                     // enabled, and never for streaming (this is the non-stream path).
+                    // The breaker observes the FINAL outcome (guard records once on
+                    // drop), so a successful retry is not masked by an earlier
+                    // transient failure.
                     if attempt < self.max_retries() && e.is_retryable() {
                         attempt += 1;
                         let backoff = self.retry.backoff_ms.saturating_mul(1u64 << (attempt - 1));
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
                         continue;
                     }
+                    guard.record(&e);
                     return Err(e);
                 }
             }
@@ -137,18 +212,21 @@ impl Provider for GovernedProvider {
 
     async fn passthrough_stream(&self, ctx: &ReqCtx, raw_body: Bytes) -> Result<RawResponse> {
         let permit = self.admit().await?;
+        // Records exactly one breaker outcome on the connect/handshake result OR
+        // on cancellation before it completes.
+        let mut guard = BreakerGuard::new(self.state.clone());
         // Streaming is NEVER retried (a partially-streamed generation cannot be
         // safely replayed — plan P3-2).
         match self.inner.passthrough_stream(ctx, raw_body).await {
             Ok(resp) => {
-                self.record_success();
+                guard.success();
                 // Hold the concurrency permit for the lifetime of the stream so
                 // the cap reflects truly in-flight upstream work, not just the
                 // connect handshake.
                 Ok(attach_permit(resp, permit))
             }
             Err(e) => {
-                self.record_error(&e);
+                guard.record(&e);
                 Err(e)
             }
         }
@@ -156,21 +234,22 @@ impl Provider for GovernedProvider {
 
     async fn chat(&self, ctx: &ReqCtx, req: ChatRequest) -> Result<ChatResponse> {
         let _permit = self.admit().await?;
+        let mut guard = BreakerGuard::new(self.state.clone());
         let mut attempt = 0;
         loop {
             match self.inner.chat(ctx, req.clone()).await {
                 Ok(resp) => {
-                    self.record_success();
+                    guard.success();
                     return Ok(resp);
                 }
                 Err(e) => {
-                    self.record_error(&e);
                     if attempt < self.max_retries() && e.is_retryable() {
                         attempt += 1;
                         let backoff = self.retry.backoff_ms.saturating_mul(1u64 << (attempt - 1));
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
                         continue;
                     }
+                    guard.record(&e);
                     return Err(e);
                 }
             }
@@ -476,5 +555,138 @@ mod tests {
             Err(Error::CircuitOpen)
         ));
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A provider whose call never completes — models an upstream stall so the
+    /// surrounding future can be cancelled (handler timeout / client disconnect)
+    /// while the governed call is still in flight.
+    struct StallProvider;
+
+    #[async_trait]
+    impl Provider for StallProvider {
+        fn upstream_id(&self) -> &str {
+            "up"
+        }
+        async fn passthrough(&self, _c: &ReqCtx, _b: Bytes) -> Result<RawResponse> {
+            futures_util::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn passthrough_stream(&self, _c: &ReqCtx, _b: Bytes) -> Result<RawResponse> {
+            futures_util::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn chat(&self, _c: &ReqCtx, _r: ChatRequest) -> Result<ChatResponse> {
+            futures_util::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    /// Codex P1: when the surrounding `tokio::time::timeout` drops the governed
+    /// future mid-call, the breaker must still see a failure (the stall is real)
+    /// AND any reserved half-open probe must be released. The `BreakerGuard`
+    /// `Drop` handles both. With threshold=2, two cancelled calls trip the breaker.
+    #[tokio::test]
+    async fn cancelled_call_counts_against_breaker_and_releases_probe() {
+        let inner = Arc::new(StallProvider);
+        let st = breaker_with_threshold(2);
+        let g = GovernedProvider::new(inner, st.clone(), retry_off());
+
+        for _ in 0..2 {
+            let r = tokio::time::timeout(
+                Duration::from_millis(20),
+                g.passthrough(&ctx(), Bytes::new()),
+            )
+            .await;
+            assert!(r.is_err(), "call should be cancelled by the timeout");
+        }
+        // Two cancellations counted as failures -> breaker open.
+        assert_eq!(st.breaker.state(), crate::breaker::BreakerState::Open);
+        // Next request fails fast (open), proving no probe slot leaked.
+        assert!(matches!(
+            g.passthrough(&ctx(), Bytes::new()).await,
+            Err(Error::CircuitOpen)
+        ));
+    }
+
+    /// Codex P1: a cancelled probe while half-open must release the probe slot so
+    /// the breaker can probe again, not get stuck forever.
+    #[tokio::test]
+    async fn cancelled_half_open_probe_does_not_wedge_the_breaker() {
+        let inner = Arc::new(StallProvider);
+        let st = Arc::new(UpstreamState {
+            limiter: None,
+            concurrency: crate::limit::Concurrency::new(None),
+            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+                failure_threshold: 1,
+                open_ms: 0, // cooldown immediately elapsed -> next call probes
+                half_open_successes: 1,
+            }),
+        });
+        // Trip the breaker open.
+        st.breaker.on_failure();
+        let g = GovernedProvider::new(inner, st.clone(), retry_off());
+
+        // First admitted call after cooldown becomes the half-open probe, then is
+        // cancelled. The guard's Drop -> on_failure re-opens and clears the flag.
+        let r = tokio::time::timeout(
+            Duration::from_millis(20),
+            g.passthrough(&ctx(), Bytes::new()),
+        )
+        .await;
+        assert!(r.is_err());
+        // The breaker is open again (probe failed via cancellation), and crucially
+        // it can still admit a fresh probe — the slot was not wedged.
+        assert!(
+            st.breaker.check().is_ok(),
+            "a new probe must be admittable after a cancelled probe"
+        );
+    }
+
+    /// Codex P2: with retry enabled, a transient `UpstreamUnavailable` followed by
+    /// a success must leave the breaker CLOSED — the breaker observes the FINAL
+    /// outcome of the call, not each attempt. (Previously each attempt recorded,
+    /// so a transient failure could open the breaker despite the call succeeding.)
+    #[tokio::test]
+    async fn successful_retry_leaves_breaker_closed() {
+        // Provider that fails the first attempt (connect failure) then succeeds.
+        struct FlakyProvider {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for FlakyProvider {
+            fn upstream_id(&self) -> &str {
+                "up"
+            }
+            async fn passthrough(&self, _c: &ReqCtx, _b: Bytes) -> Result<RawResponse> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Err(Error::UpstreamUnavailable)
+                } else {
+                    Ok(RawResponse {
+                        status: 200,
+                        content_type: None,
+                        body: empty_stream(),
+                    })
+                }
+            }
+            async fn passthrough_stream(&self, _c: &ReqCtx, _b: Bytes) -> Result<RawResponse> {
+                unreachable!()
+            }
+            async fn chat(&self, _c: &ReqCtx, _r: ChatRequest) -> Result<ChatResponse> {
+                unreachable!()
+            }
+        }
+        let inner = Arc::new(FlakyProvider {
+            calls: AtomicUsize::new(0),
+        });
+        // failure_threshold=1 would open immediately if the breaker counted the
+        // first (retried) attempt.
+        let st = breaker_with_threshold(1);
+        let g = GovernedProvider::new(inner.clone(), st.clone(), retry_on(2));
+
+        assert!(g.passthrough(&ctx(), Bytes::new()).await.is_ok());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2, "one retry happened");
+        // Final outcome was success -> breaker stays closed.
+        assert_eq!(st.breaker.state(), crate::breaker::BreakerState::Closed);
     }
 }
