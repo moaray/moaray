@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 default-run = "moaray"
 
+[lib]
+name = "moaray"
+path = "src/lib.rs"
+
 [[bin]]
 name = "moaray"
 path = "src/main.rs"
@@ -39,3 +43,5 @@ http = "1"
 
 [dev-dependencies]
 wiremock.workspace = true
+tracing-subscriber.workspace = true
+tower.workspace = true

@@ -87,19 +87,11 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
         if k.allow_models.is_empty() {
             return Err(ConfigError::EmptyAllowlist(k.id));
         }
-        for m in &k.allow_models {
-            // MoA recipe names (moa/..) are allowed without being a model; only
-            // plain model names must exist.
-            if m.starts_with("moa/") || m == "moa-auto" {
-                continue;
-            }
-            if !known.contains(m) {
-                return Err(ConfigError::UnknownAllowModel {
-                    key: k.id,
-                    model: m.clone(),
-                });
-            }
-        }
+        // Note: an allowlist entry need NOT be a currently-configured model.
+        // The allowlist is authorization policy and is intentionally decoupled
+        // from the model registry: a key may be authorized for a model that the
+        // gateway does not (yet) serve, which is exactly the 404 model_not_found
+        // path. Recipe references, by contrast, must resolve (checked below).
         keys.push(KeyConfig {
             id: k.id,
             secret,

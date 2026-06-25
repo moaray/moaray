@@ -11,9 +11,6 @@ pub enum ConfigError {
     #[error("duplicate model name: {0}")]
     DuplicateModel(String),
 
-    #[error("key `{key}` allowlist references unknown model `{model}`")]
-    UnknownAllowModel { key: String, model: String },
-
     #[error("key `{0}` has an empty allow_models list")]
     EmptyAllowlist(String),
 

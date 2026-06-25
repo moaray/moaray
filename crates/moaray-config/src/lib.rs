@@ -114,13 +114,18 @@ models:
     }
 
     #[test]
-    fn rejects_unknown_provider_reference_in_allowlist() {
+    fn allowlist_may_reference_an_unconfigured_model() {
+        // The allowlist is authorization policy, decoupled from the model
+        // registry: a key may be authorized for a model the gateway does not
+        // currently serve (that request then 404s at runtime, not at load).
         let y = r#"
-auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [ghost]}]}
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [ghost, gpt]}]}
 models:
   - {name: gpt, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY}
 "#;
-        assert!(matches!(reject(y), ConfigError::UnknownAllowModel { .. }));
+        let cfg = load_yaml_with_env(y, &env()).expect("valid");
+        assert!(cfg.keys[0].allows("ghost"));
+        assert!(!cfg.is_known_model("ghost"));
     }
 
     #[test]
