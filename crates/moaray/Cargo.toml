@@ -1,0 +1,41 @@
+[package]
+name = "moaray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "moaray"
+
+[[bin]]
+name = "moaray"
+path = "src/main.rs"
+
+[dependencies]
+moaray-core = { path = "../moaray-core" }
+moaray-config = { path = "../moaray-config" }
+moaray-providers = { path = "../moaray-providers" }
+moaray-moa = { path = "../moaray-moa" }
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+arc-swap.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+http = "1"
+
+[dev-dependencies]
+wiremock.workspace = true
