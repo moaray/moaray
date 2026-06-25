@@ -34,7 +34,11 @@ struct SseParser {
 }
 
 impl SseParser {
-    fn push(&mut self, chunk: &[u8], out: &mut Vec<SseEvent>) {
+    /// Feed raw bytes, appending any newly completed events to `out`. Returns an
+    /// error if a *complete* line is not valid UTF-8 (a genuine upstream protocol
+    /// error — distinct from a multibyte char merely split across chunks, which
+    /// stays buffered until the line completes and decodes cleanly).
+    fn push(&mut self, chunk: &[u8], out: &mut Vec<SseEvent>) -> Result<(), Error> {
         self.buf.extend_from_slice(chunk);
         // Process complete lines; keep any trailing partial line in buf.
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
@@ -43,8 +47,13 @@ impl SseParser {
             if raw.last() == Some(&b'\r') {
                 raw.pop();
             }
-            // A complete line is a valid UTF-8 boundary; lossy is a safety net.
-            let line = String::from_utf8_lossy(&raw).into_owned();
+            // A complete line is a UTF-8 boundary; decode strictly so genuinely
+            // malformed upstream bytes surface as an error instead of being
+            // silently replaced with U+FFFD.
+            let line = match std::str::from_utf8(&raw) {
+                Ok(s) => s.to_string(),
+                Err(_) => return Err(Error::UpstreamError),
+            };
             if line.is_empty() {
                 // dispatch the event if it has any data/type
                 if self.cur.event.is_some() || !self.cur.data.is_empty() {
@@ -62,6 +71,7 @@ impl SseParser {
             }
             // comment lines (":...") and unknown fields are ignored
         }
+        Ok(())
     }
 }
 
@@ -84,7 +94,10 @@ where
                 Err(e) => { yield Err(e); return; }
             };
             let mut events = Vec::new();
-            parser.push(&bytes, &mut events);
+            if let Err(e) = parser.push(&bytes, &mut events) {
+                yield Err(e);
+                return;
+            }
             for ev in events {
                 let data = ev.data.trim();
                 if data.is_empty() { continue; }
@@ -239,6 +252,21 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert!(out.contains('\u{4f60}'), "out: {out}");
         assert!(out.contains('\u{597d}'), "out: {out}");
         assert!(out.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn malformed_utf8_in_complete_line_errors() {
+        // A complete line with an invalid UTF-8 byte (0xFF) must surface as an
+        // upstream error, not be silently replaced.
+        let mut bytes = b"data: {\"x\":\"".to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"\"}\n\n");
+        let s = stream::iter(vec![Ok(Bytes::from(bytes))]);
+        let st = translate(s, "c".into());
+        futures_util::pin_mut!(st);
+        let first = st.next().await.unwrap();
+        assert!(first.is_err());
+        assert_eq!(first.unwrap_err().envelope().status, 502);
     }
 
     #[tokio::test]
