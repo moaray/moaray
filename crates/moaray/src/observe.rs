@@ -43,6 +43,11 @@ pub fn status_class(status: u16) -> &'static str {
 pub enum RequestPath {
     Passthrough,
     Moa,
+    /// A request rejected *before* routing (auth/allowlist/limit/body checks), so
+    /// no upstream path was selected. A fixed label so these protective rejections
+    /// are still visible on `/metrics` (plan P3-1: an inbound limit that never
+    /// shows up in metrics is unobservable).
+    PreRouting,
 }
 
 impl RequestPath {
@@ -51,6 +56,7 @@ impl RequestPath {
         match self {
             RequestPath::Passthrough => "passthrough",
             RequestPath::Moa => "moa",
+            RequestPath::PreRouting => "pre_routing",
         }
     }
 }
@@ -84,6 +90,37 @@ pub fn record_request(path: RequestPath, model: &str, status: u16, latency_secs:
         "model" => model.to_string()
     )
     .record(latency_secs);
+}
+
+/// Record a request rejected before routing (auth/allowlist/per-key limit/body
+/// limit/bad request). These are counted under the fixed `path="pre_routing"`
+/// label so the inbound protections (notably per-key 429) are visible on
+/// `/metrics` — a protective rejection that never increments a counter is
+/// unobservable (plan P3-1).
+///
+/// The caller-supplied model name is deliberately NOT a label here: at this
+/// stage the model is unvalidated client input (unbounded cardinality) and may
+/// not even exist, so it is collapsed to a fixed `model="_pre_routing"` sentinel.
+/// `status_class` keeps the same 2xx/4xx/5xx bucketing as routed requests.
+pub fn record_rejection(status: u16) {
+    let class = status_class(status);
+    let path = RequestPath::PreRouting.as_str();
+    metrics::counter!(
+        "moaray_requests_total",
+        "path" => path,
+        "model" => "_pre_routing",
+        "status_class" => class
+    )
+    .increment(1);
+    if status >= 400 {
+        metrics::counter!(
+            "moaray_errors_total",
+            "path" => path,
+            "model" => "_pre_routing",
+            "status_class" => class
+        )
+        .increment(1);
+    }
 }
 
 /// Record one MoA arm's outcome.

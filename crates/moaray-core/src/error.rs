@@ -42,11 +42,23 @@ pub enum Error {
     #[error("upstream request timed out")]
     UpstreamTimeout,
 
-    /// Upstream returned a non-429 error status. -> 502
+    /// Upstream returned a non-429 server-class error status (5xx). This is a
+    /// genuine upstream-health fault and counts against the circuit breaker (see
+    /// [`Error::counts_against_breaker`]). -> 502
     #[error("upstream returned an error")]
     UpstreamError,
 
-    /// Upstream returned 429. -> 429
+    /// Upstream returned a 4xx client-class status (e.g. 400/401/403/404). The
+    /// upstream is reachable and answering — the failure is attributable to the
+    /// request itself or to upstream credential/config, NOT to upstream health —
+    /// so it is **breaker-neutral** (see [`Error::counts_against_breaker`]). The
+    /// client-facing envelope is identical to [`Error::UpstreamError`] (502
+    /// `upstream_error`) so provider internals are never leaked. -> 502
+    #[error("upstream returned a client error")]
+    UpstreamClientError,
+
+    /// Upstream returned 429. The upstream is up but throttling, so this is
+    /// breaker-neutral (see [`Error::counts_against_breaker`]). -> 429
     #[error("upstream rate limited")]
     UpstreamRateLimited,
 
@@ -112,6 +124,7 @@ impl Error {
             Error::BadRequest(_) => (400, TYPE_INVALID_REQUEST, "invalid_request"),
             Error::UpstreamTimeout => (504, TYPE_API_ERROR, "upstream_timeout"),
             Error::UpstreamError => (502, TYPE_API_ERROR, "upstream_error"),
+            Error::UpstreamClientError => (502, TYPE_API_ERROR, "upstream_error"),
             Error::UpstreamRateLimited => (429, TYPE_RATE_LIMIT, "upstream_rate_limited"),
             Error::UpstreamUnavailable => (502, TYPE_API_ERROR, "upstream_error"),
             Error::RateLimited => (429, TYPE_RATE_LIMIT, "rate_limited"),
@@ -144,6 +157,33 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Error::UpstreamUnavailable)
     }
+
+    /// Whether this error should count as an *upstream-health* failure against
+    /// the per-upstream circuit breaker.
+    ///
+    /// Only genuine upstream faults count: a server-class 5xx
+    /// ([`Error::UpstreamError`]), a request that timed out
+    /// ([`Error::UpstreamTimeout`]), or a connect/transport failure
+    /// ([`Error::UpstreamUnavailable`]). These mean the upstream is unhealthy and
+    /// hammering it should stop.
+    ///
+    /// Breaker-**neutral** outcomes (return `false`):
+    /// - [`Error::UpstreamClientError`] — a 4xx means the upstream is up and
+    ///   answering; the fault is the request's or the upstream credential/config.
+    ///   Counting it would let one caller's malformed requests, or a single
+    ///   misconfigured key (persistent 401/403), trip the *shared* per-upstream
+    ///   breaker and fail-fast every other caller/model on that upstream while
+    ///   masking the real cause.
+    /// - [`Error::UpstreamRateLimited`] — a 429 means the upstream is up but
+    ///   throttling; opening the breaker on throttling would amplify, not relieve.
+    /// - the gateway's own errors (rate limit, circuit open, bad request, …),
+    ///   which never reflect upstream health.
+    pub fn counts_against_breaker(&self) -> bool {
+        matches!(
+            self,
+            Error::UpstreamError | Error::UpstreamTimeout | Error::UpstreamUnavailable
+        )
+    }
 }
 
 /// Convenience result alias.
@@ -170,6 +210,7 @@ mod tests {
             (Error::PayloadTooLarge, 413, "payload_too_large"),
             (Error::UpstreamTimeout, 504, "upstream_timeout"),
             (Error::UpstreamError, 502, "upstream_error"),
+            (Error::UpstreamClientError, 502, "upstream_error"),
             (Error::UpstreamRateLimited, 429, "upstream_rate_limited"),
             (Error::UpstreamUnavailable, 502, "upstream_error"),
             (Error::RateLimited, 429, "rate_limited"),
@@ -213,7 +254,24 @@ mod tests {
         assert!(!Error::UpstreamError.is_retryable());
         assert!(!Error::UpstreamTimeout.is_retryable());
         assert!(!Error::UpstreamRateLimited.is_retryable());
+        assert!(!Error::UpstreamClientError.is_retryable());
         assert!(!Error::CircuitOpen.is_retryable());
         assert!(!Error::Internal.is_retryable());
+    }
+
+    #[test]
+    fn only_upstream_health_faults_count_against_breaker() {
+        // Genuine upstream-health faults trip the breaker.
+        assert!(Error::UpstreamError.counts_against_breaker());
+        assert!(Error::UpstreamTimeout.counts_against_breaker());
+        assert!(Error::UpstreamUnavailable.counts_against_breaker());
+        // Breaker-neutral: upstream is up and answering / throttling.
+        assert!(!Error::UpstreamClientError.counts_against_breaker());
+        assert!(!Error::UpstreamRateLimited.counts_against_breaker());
+        // Gateway-own errors never reflect upstream health.
+        assert!(!Error::RateLimited.counts_against_breaker());
+        assert!(!Error::CircuitOpen.counts_against_breaker());
+        assert!(!Error::BadRequest("x".into()).counts_against_breaker());
+        assert!(!Error::Internal.counts_against_breaker());
     }
 }

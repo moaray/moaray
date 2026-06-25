@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use moaray_config::RetryConfig;
-use moaray_core::error::Result;
+use moaray_core::error::{Error, Result};
 use moaray_core::provider::{ByteStream, Provider, RawResponse, ReqCtx};
 use moaray_core::types::{ChatRequest, ChatResponse};
 use tokio::sync::OwnedSemaphorePermit;
@@ -48,23 +48,48 @@ impl GovernedProvider {
 
     /// Run the breaker + limiter admission checks. Returns a held concurrency
     /// permit (or `None` when unbounded) once admitted.
+    ///
+    /// The breaker check may reserve a single half-open probe slot; if a later
+    /// gate (rate limit / concurrency) then rejects the request, the reserved
+    /// probe is released so the breaker can probe again later (it never reached
+    /// the upstream, so it is neither a success nor a failure).
     async fn admit(&self) -> Result<Option<OwnedSemaphorePermit>> {
-        // 1. circuit breaker — fail fast if open.
+        // 1. circuit breaker — fail fast if open (may reserve a half-open probe).
         self.state.breaker.check()?;
         // 2. per-upstream token bucket.
-        self.state.check_limit()?;
+        if let Err(e) = self.state.check_limit() {
+            self.state.breaker.release_probe();
+            return Err(e);
+        }
         // 3. concurrency cap (permit released on drop / cancellation).
-        self.state.concurrency.acquire().await
+        match self.state.concurrency.acquire().await {
+            Ok(permit) => Ok(permit),
+            Err(e) => {
+                self.state.breaker.release_probe();
+                Err(e)
+            }
+        }
     }
 
-    /// Record an outcome against the breaker. Every provider error here is an
-    /// upstream/transport failure (the gateway's own 4xx never reaches a
-    /// provider), so any `Err` counts against the breaker.
-    fn record(&self, ok: bool) {
-        if ok {
-            self.state.breaker.on_success();
-        } else {
+    /// Record a successful upstream outcome against the breaker.
+    fn record_success(&self) {
+        self.state.breaker.on_success();
+    }
+
+    /// Record a failed upstream outcome against the breaker.
+    ///
+    /// Only genuine upstream-health faults (5xx / timeout / connect) trip the
+    /// breaker; an upstream 4xx ([`Error::UpstreamClientError`]) or 429
+    /// ([`Error::UpstreamRateLimited`]) means the upstream is up and answering,
+    /// so it is reported as breaker-neutral (a *success* to the breaker) — this
+    /// keeps one caller's malformed requests or a single misconfigured key from
+    /// tripping the shared per-upstream breaker and fail-fasting every other
+    /// caller/model (see [`Error::counts_against_breaker`]).
+    fn record_error(&self, err: &Error) {
+        if err.counts_against_breaker() {
             self.state.breaker.on_failure();
+        } else {
+            self.state.breaker.on_success();
         }
     }
 
@@ -91,11 +116,11 @@ impl Provider for GovernedProvider {
             let result = self.inner.passthrough(ctx, raw_body.clone()).await;
             match result {
                 Ok(resp) => {
-                    self.record(true);
+                    self.record_success();
                     return Ok(resp);
                 }
                 Err(e) => {
-                    self.record(false);
+                    self.record_error(&e);
                     // Retry ONLY connect failures (request never sent), only when
                     // enabled, and never for streaming (this is the non-stream path).
                     if attempt < self.max_retries() && e.is_retryable() {
@@ -116,14 +141,14 @@ impl Provider for GovernedProvider {
         // safely replayed — plan P3-2).
         match self.inner.passthrough_stream(ctx, raw_body).await {
             Ok(resp) => {
-                self.record(true);
+                self.record_success();
                 // Hold the concurrency permit for the lifetime of the stream so
                 // the cap reflects truly in-flight upstream work, not just the
                 // connect handshake.
                 Ok(attach_permit(resp, permit))
             }
             Err(e) => {
-                self.record(false);
+                self.record_error(&e);
                 Err(e)
             }
         }
@@ -135,11 +160,11 @@ impl Provider for GovernedProvider {
         loop {
             match self.inner.chat(ctx, req.clone()).await {
                 Ok(resp) => {
-                    self.record(true);
+                    self.record_success();
                     return Ok(resp);
                 }
                 Err(e) => {
-                    self.record(false);
+                    self.record_error(&e);
                     if attempt < self.max_retries() && e.is_retryable() {
                         attempt += 1;
                         let backoff = self.retry.backoff_ms.saturating_mul(1u64 << (attempt - 1));
@@ -370,5 +395,86 @@ mod tests {
             Err(Error::CircuitOpen)
         ));
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn breaker_with_threshold(threshold: u32) -> Arc<UpstreamState> {
+        Arc::new(UpstreamState {
+            limiter: None,
+            concurrency: crate::limit::Concurrency::new(None),
+            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+                failure_threshold: threshold,
+                open_ms: 60_000,
+                half_open_successes: 1,
+            }),
+        })
+    }
+
+    /// P1 regression: an upstream **4xx** (`UpstreamClientError`) is the
+    /// upstream's request/credential fault, not an upstream-health failure, so it
+    /// must be breaker-neutral. Many consecutive 4xx must NOT open the breaker —
+    /// otherwise one client's malformed requests, or a misconfigured key
+    /// (persistent 401/403), would trip the shared per-upstream breaker and
+    /// fail-fast every other caller/model on that upstream.
+    #[tokio::test]
+    async fn upstream_4xx_does_not_open_the_breaker() {
+        let inner = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+            mode: Mode::AlwaysErr(|| Error::UpstreamClientError),
+        });
+        let st = breaker_with_threshold(2);
+        let g = GovernedProvider::new(inner.clone(), st.clone(), retry_off());
+        // Far more failures than the threshold (2).
+        for _ in 0..10 {
+            let r = g.passthrough(&ctx(), Bytes::new()).await;
+            assert!(matches!(r, Err(Error::UpstreamClientError)));
+        }
+        // Breaker stays closed; every request still reached the upstream (no
+        // fail-fast), and the next call is admitted normally.
+        assert_eq!(st.breaker.state(), crate::breaker::BreakerState::Closed);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 10);
+    }
+
+    /// P1 sibling: an upstream **429** (`UpstreamRateLimited`) is throttling, not
+    /// an upstream-health failure — also breaker-neutral.
+    #[tokio::test]
+    async fn upstream_429_does_not_open_the_breaker() {
+        let inner = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+            mode: Mode::AlwaysErr(|| Error::UpstreamRateLimited),
+        });
+        let st = breaker_with_threshold(2);
+        let g = GovernedProvider::new(inner.clone(), st.clone(), retry_off());
+        for _ in 0..10 {
+            let _ = g.passthrough(&ctx(), Bytes::new()).await;
+        }
+        assert_eq!(st.breaker.state(), crate::breaker::BreakerState::Closed);
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 10);
+    }
+
+    /// Contrast: a genuine upstream-health fault (5xx -> `UpstreamError`) DOES
+    /// open the breaker after the threshold, then fails fast.
+    #[tokio::test]
+    async fn upstream_5xx_opens_the_breaker() {
+        let inner = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+            mode: Mode::AlwaysErr(|| Error::UpstreamError),
+        });
+        let st = breaker_with_threshold(2);
+        let g = GovernedProvider::new(inner.clone(), st.clone(), retry_off());
+        assert!(matches!(
+            g.passthrough(&ctx(), Bytes::new()).await,
+            Err(Error::UpstreamError)
+        ));
+        assert!(matches!(
+            g.passthrough(&ctx(), Bytes::new()).await,
+            Err(Error::UpstreamError)
+        ));
+        // Threshold reached -> open; third request fails fast without the upstream.
+        assert_eq!(st.breaker.state(), crate::breaker::BreakerState::Open);
+        assert!(matches!(
+            g.passthrough(&ctx(), Bytes::new()).await,
+            Err(Error::CircuitOpen)
+        ));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
     }
 }

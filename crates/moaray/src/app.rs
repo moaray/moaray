@@ -24,7 +24,9 @@ use uuid::Uuid;
 
 use crate::auth::{authenticate, parse_bearer};
 use crate::http_error::ApiError;
-use crate::observe::{record_moa_arm, record_request, render_metrics, RequestPath};
+use crate::observe::{
+    record_moa_arm, record_rejection, record_request, render_metrics, RequestPath,
+};
 use crate::runtime::AppState;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -113,7 +115,30 @@ async fn list_models(State(ctx): State<ServerCtx>, req: Request) -> Result<Respo
     Ok(axum::Json(json!({"object": "list", "data": data})).into_response())
 }
 
+/// A request that passed every pre-routing gate and is ready to execute.
+enum Routed {
+    Passthrough {
+        auth: crate::auth::AuthContext,
+        raw: Bytes,
+        model: String,
+        stream: bool,
+        provider: std::sync::Arc<dyn moaray_core::provider::Provider>,
+    },
+    Moa {
+        caller_key_id: String,
+        recipe: String,
+        raw: Bytes,
+        model: String,
+    },
+}
+
 /// `POST /v1/chat/completions` — auth, route, passthrough (stream or not).
+///
+/// Pre-routing gates (auth / per-key limit / body / parse / allowlist / route)
+/// run in [`pre_route`]; any rejection there is recorded under
+/// `path="pre_routing"` so inbound protections (notably the per-key 429) are
+/// visible on `/metrics` (plan P3-1). Once routed, the passthrough / MoA paths
+/// record their own outcome.
 async fn chat_completions(
     State(ctx): State<ServerCtx>,
     req: Request,
@@ -125,6 +150,49 @@ async fn chat_completions(
         .map(|r| r.0.clone())
         .unwrap_or_default();
 
+    let routed = match pre_route(&ctx, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            // A protective rejection before any upstream path was chosen — count
+            // it so /metrics reflects the inbound limit/auth/body checks.
+            record_rejection(e.envelope().status);
+            return Err(e.into());
+        }
+    };
+
+    match routed {
+        Routed::Passthrough {
+            auth,
+            raw,
+            model,
+            stream,
+            provider,
+        } => passthrough(ctx, request_id, auth, raw, model, stream, started, provider).await,
+        Routed::Moa {
+            caller_key_id,
+            recipe,
+            raw,
+            model,
+        } => {
+            let runtime = ctx.state.runtime.load_full();
+            run_moa(
+                ctx,
+                runtime,
+                request_id,
+                caller_key_id,
+                recipe,
+                raw,
+                model,
+                started,
+            )
+            .await
+        }
+    }
+}
+
+/// Run every pre-routing gate and resolve the request to a [`Routed`] decision.
+/// Returns the canonical [`Error`] on any rejection (recorded by the caller).
+async fn pre_route(ctx: &ServerCtx, req: Request) -> Result<Routed, Error> {
     // auth first (401 on missing/invalid) — own the token before consuming req.
     let token = parse_bearer(
         req.headers()
@@ -146,7 +214,7 @@ async fn chat_completions(
     let body = req.into_body();
     let raw = match axum::body::to_bytes(body, ctx.max_body_bytes).await {
         Ok(b) => b,
-        Err(_) => return Err(Error::PayloadTooLarge.into()),
+        Err(_) => return Err(Error::PayloadTooLarge),
     };
 
     // Parse just enough to learn the model + stream flag (without losing data).
@@ -164,41 +232,36 @@ async fn chat_completions(
 
     // allowlist (403) — checked before routing so unauthorized models can't probe.
     if !auth.allows(&model) {
-        return Err(Error::ModelNotAllowed { model }.into());
+        return Err(Error::ModelNotAllowed { model });
     }
 
     // route by model name
-    let target = route(&model, |m| rt.config.is_known_model(m));
-    match target {
+    match route(&model, |m| rt.config.is_known_model(m)) {
         RouteTarget::Passthrough { model } => {
             let provider = rt.provider(&model).ok_or_else(|| Error::ModelNotFound {
                 model: model.clone(),
             })?;
-            drop(rt);
-            passthrough(ctx, request_id, auth, raw, model, stream, started, provider).await
+            Ok(Routed::Passthrough {
+                auth,
+                raw,
+                model,
+                stream,
+                provider,
+            })
         }
         RouteTarget::Moa { recipe } => {
             // v1 MoA is non-streaming only (DESIGN §4): reject stream up front.
             if stream {
-                return Err(Error::MoaStreamingUnsupported.into());
+                return Err(Error::MoaStreamingUnsupported);
             }
-            drop(rt);
-            // Own the runtime Arc across the (awaited) fan-out instead of holding
-            // the ArcSwap guard.
-            let runtime = ctx.state.runtime.load_full();
-            run_moa(
-                ctx,
-                runtime,
-                request_id,
-                auth.key_id.clone(),
+            Ok(Routed::Moa {
+                caller_key_id: auth.key_id.clone(),
                 recipe,
                 raw,
                 model,
-                started,
-            )
-            .await
+            })
         }
-        RouteTarget::Unknown { model } => Err(Error::ModelNotFound { model }.into()),
+        RouteTarget::Unknown { model } => Err(Error::ModelNotFound { model }),
     }
 }
 

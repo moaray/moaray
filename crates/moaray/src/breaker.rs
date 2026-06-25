@@ -9,8 +9,11 @@
 //! - **Closed**: requests flow. `failure_threshold` consecutive failures -> Open.
 //! - **Open**: requests fail fast with [`Error::CircuitOpen`] until `open_ms`
 //!   elapses, then the next request is allowed as a half-open probe.
-//! - **HalfOpen**: a probe is in flight. `half_open_successes` consecutive
-//!   successes -> Closed; any failure -> Open again.
+//! - **HalfOpen**: a *single* probe is allowed in flight at a time; concurrent
+//!   requests while a probe is outstanding fail fast with [`Error::CircuitOpen`]
+//!   so a recovering (possibly still-bad) upstream is not stampeded.
+//!   `half_open_successes` consecutive probe successes -> Closed; any probe
+//!   failure -> Open again.
 //!
 //! Only an *upstream* failure (5xx/timeout/connect) counts against the breaker;
 //! client errors (4xx, e.g. a bad request) are not the upstream's fault and are
@@ -46,6 +49,12 @@ struct Inner {
     consecutive_successes: u32,
     /// When the breaker opened; used to time the half-open probe window.
     opened_at: Option<Instant>,
+    /// Whether a half-open probe is currently outstanding. While `true`, further
+    /// half-open admissions fail fast so only one probe at a time tests a
+    /// recovering upstream (no thundering herd). Cleared when the probe records
+    /// its outcome via [`CircuitBreaker::on_success_at`] /
+    /// [`CircuitBreaker::on_failure_at`].
+    probe_in_flight: bool,
 }
 
 /// A per-upstream circuit breaker.
@@ -64,6 +73,7 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 consecutive_successes: 0,
                 opened_at: None,
+                probe_in_flight: false,
             }),
         }
     }
@@ -73,13 +83,24 @@ impl CircuitBreaker {
     pub fn check_at(&self, now: Instant) -> Result<()> {
         let mut g = self.inner.lock().expect("breaker mutex");
         match g.state {
-            BreakerState::Closed | BreakerState::HalfOpen => Ok(()),
+            BreakerState::Closed => Ok(()),
+            BreakerState::HalfOpen => {
+                // Only one probe at a time may test a recovering upstream.
+                if g.probe_in_flight {
+                    Err(Error::CircuitOpen)
+                } else {
+                    g.probe_in_flight = true;
+                    Ok(())
+                }
+            }
             BreakerState::Open => {
                 let open_for = g.opened_at.map(|t| now.duration_since(t));
                 if matches!(open_for, Some(d) if d >= Duration::from_millis(self.cfg.open_ms)) {
-                    // Cooldown elapsed: allow a single half-open probe.
+                    // Cooldown elapsed: admit exactly one half-open probe and mark
+                    // it in flight so concurrent callers still fail fast.
                     g.state = BreakerState::HalfOpen;
                     g.consecutive_successes = 0;
+                    g.probe_in_flight = true;
                     Ok(())
                 } else {
                     Err(Error::CircuitOpen)
@@ -102,6 +123,9 @@ impl CircuitBreaker {
                 g.consecutive_failures = 0;
             }
             BreakerState::HalfOpen => {
+                // The outstanding probe finished; allow the next one to be admitted
+                // if we are still recovering.
+                g.probe_in_flight = false;
                 g.consecutive_successes += 1;
                 if g.consecutive_successes >= self.cfg.half_open_successes {
                     g.state = BreakerState::Closed;
@@ -126,10 +150,12 @@ impl CircuitBreaker {
                 }
             }
             BreakerState::HalfOpen => {
-                // Probe failed: re-open immediately.
+                // Probe failed: re-open immediately and clear the in-flight flag
+                // (the next probe will be admitted only after the cooldown).
                 g.state = BreakerState::Open;
                 g.opened_at = Some(now);
                 g.consecutive_successes = 0;
+                g.probe_in_flight = false;
             }
             BreakerState::Open => {
                 g.opened_at = Some(now);
@@ -143,6 +169,19 @@ impl CircuitBreaker {
 
     pub fn on_failure(&self) {
         self.on_failure_at(Instant::now());
+    }
+
+    /// Release a half-open probe slot reserved by [`Self::check_at`] without
+    /// recording an outcome. Used when a *later* admission gate (rate limit /
+    /// concurrency) rejects the request after the breaker already admitted it, so
+    /// the reserved probe never actually reaches the upstream. Without this the
+    /// `probe_in_flight` flag would stay set forever and the breaker could never
+    /// probe again. No-op outside HalfOpen / when no probe is outstanding.
+    pub fn release_probe(&self) {
+        let mut g = self.inner.lock().expect("breaker mutex");
+        if g.state == BreakerState::HalfOpen {
+            g.probe_in_flight = false;
+        }
     }
 
     /// Current state (for metrics/tests).
@@ -225,5 +264,71 @@ mod tests {
         b.on_failure_at(t);
         b.on_failure_at(t);
         assert_eq!(b.state(), BreakerState::Closed); // only 2 since reset
+    }
+
+    #[test]
+    fn half_open_admits_only_a_single_concurrent_probe() {
+        let b = CircuitBreaker::new(cfg());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.on_failure_at(t0);
+        }
+        assert_eq!(b.state(), BreakerState::Open);
+        let after = t0 + Duration::from_millis(1001);
+        // First admission after cooldown becomes the half-open probe.
+        assert!(b.check_at(after).is_ok());
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        // A *concurrent* second request while the probe is in flight must fail
+        // fast — no thundering herd onto a recovering upstream.
+        assert!(matches!(b.check_at(after), Err(Error::CircuitOpen)));
+        assert!(matches!(b.check_at(after), Err(Error::CircuitOpen)));
+        // The probe succeeds (needs 2 successes to close); the breaker stays
+        // half-open and now admits exactly one more probe, not a flood.
+        b.on_success_at(after);
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        assert!(b.check_at(after).is_ok(), "next single probe admitted");
+        assert!(
+            matches!(b.check_at(after), Err(Error::CircuitOpen)),
+            "still only one probe at a time"
+        );
+    }
+
+    #[test]
+    fn release_probe_lets_a_new_probe_in_after_a_rejected_admission() {
+        let b = CircuitBreaker::new(cfg());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.on_failure_at(t0);
+        }
+        let after = t0 + Duration::from_millis(1001);
+        // Reserve the probe, then a downstream gate rejects: release it.
+        assert!(b.check_at(after).is_ok());
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        b.release_probe();
+        // The freed slot allows the next request to probe.
+        assert!(
+            b.check_at(after).is_ok(),
+            "released probe slot must be reusable"
+        );
+        assert!(matches!(b.check_at(after), Err(Error::CircuitOpen)));
+    }
+
+    #[test]
+    fn half_open_probe_failure_clears_flag_and_reopens() {
+        let b = CircuitBreaker::new(cfg());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            b.on_failure_at(t0);
+        }
+        let after = t0 + Duration::from_millis(1001);
+        assert!(b.check_at(after).is_ok());
+        assert_eq!(b.state(), BreakerState::HalfOpen);
+        // Probe fails -> Open; a fresh cooldown later admits exactly one probe
+        // again (the in-flight flag did not leak).
+        b.on_failure_at(after);
+        assert_eq!(b.state(), BreakerState::Open);
+        let after2 = after + Duration::from_millis(1001);
+        assert!(b.check_at(after2).is_ok());
+        assert!(matches!(b.check_at(after2), Err(Error::CircuitOpen)));
     }
 }

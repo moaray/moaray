@@ -75,6 +75,23 @@ async fn post(app: axum::Router, model: &str) -> StatusCode {
     .status()
 }
 
+/// Scrape `/metrics` and return the body as text.
+async fn scrape_metrics(app: axum::Router) -> String {
+    let m = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(m.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
 /// P3-1: per-key inbound limit returns 429 once the bucket is drained.
 #[tokio::test]
 async fn per_key_rate_limit_returns_429() {
@@ -414,4 +431,152 @@ recipes:
         !text.contains("api_key") && !text.contains("authorization"),
         "credential-ish label present in metrics"
     );
+}
+
+/// P2 (rework): a per-key 429 (and every pre-routing rejection) must be visible
+/// on /metrics. Before the fix `check_key_limit` returned before any
+/// `record_request`, so the headline inbound-limit feature was unobservable.
+#[tokio::test]
+async fn per_key_429_is_reflected_in_metrics() {
+    set_keys();
+    let server = MockServer::start().await;
+    mount_ok(&server).await;
+    let yaml = format!(
+        r#"
+auth:
+  keys:
+    - id: team-a
+      key_env: MOARAY_HARDEN_INBOUND
+      allow_models: [gpt]
+      rate_limit: {{rps: 1, burst: 1}}
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: {uri}
+    api_key_env: MOARAY_HARDEN_UPSTREAM
+    upstream_id: up-gpt
+"#,
+        uri = server.uri()
+    );
+    let app = app_from_yaml(&yaml);
+    // burst 1 -> first OK, second is the per-key 429.
+    assert_eq!(post(app.clone(), "gpt").await, StatusCode::OK);
+    assert_eq!(
+        post(app.clone(), "gpt").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let text = scrape_metrics(app).await;
+    // The pre-routing rejection path is present and counted as a 4xx error.
+    assert!(
+        text.contains("path=\"pre_routing\""),
+        "pre-routing rejections must appear on /metrics:\n{text}"
+    );
+    // Both the requests counter and the errors counter must carry the rejection.
+    let rejection_request = text.lines().any(|l| {
+        l.starts_with("moaray_requests_total")
+            && l.contains("path=\"pre_routing\"")
+            && l.contains("status_class=\"4xx\"")
+    });
+    let rejection_error = text.lines().any(|l| {
+        l.starts_with("moaray_errors_total")
+            && l.contains("path=\"pre_routing\"")
+            && l.contains("status_class=\"4xx\"")
+    });
+    assert!(
+        rejection_request,
+        "per-key 429 missing from moaray_requests_total:\n{text}"
+    );
+    assert!(
+        rejection_error,
+        "per-key 429 missing from moaray_errors_total:\n{text}"
+    );
+    // Discipline preserved: the caller-supplied model name is NOT a label for
+    // pre-routing rejections (collapsed to the fixed sentinel).
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("path=\"pre_routing\"") && l.contains("model=\"gpt\"")),
+        "pre-routing must not label the caller-supplied model:\n{text}"
+    );
+}
+
+/// P2 (rework): the per-upstream concurrency cap + streaming-permit lifecycle is
+/// load-bearing but was only unit-tested on the raw semaphore. This drives it
+/// end-to-end through the real app: with cap=1, a held in-flight stream blocks a
+/// second call; dropping the first stream's body releases the permit and the
+/// second call proceeds.
+#[tokio::test]
+async fn concurrency_cap_blocks_second_call_until_first_stream_drops() {
+    set_keys();
+    let server = MockServer::start().await;
+    // A streaming (SSE) upstream response — the relayed body stream holds the
+    // concurrency permit for its lifetime (governed.rs attach_permit).
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let yaml = format!(
+        r#"
+server:
+  request_timeout_ms: 2000
+auth:
+  keys:
+    - id: team-a
+      key_env: MOARAY_HARDEN_INBOUND
+      allow_models: [gpt]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: {uri}
+    api_key_env: MOARAY_HARDEN_UPSTREAM
+    upstream_id: up-shared
+    max_concurrency: 1
+"#,
+        uri = server.uri()
+    );
+    let app = app_from_yaml(&yaml);
+
+    let stream_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, "Bearer sk-inbound")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"gpt","stream":true,"messages":[]}"#))
+            .unwrap()
+    };
+
+    // First streaming call: returns with the permit held by the (unconsumed) body.
+    let first = app.clone().oneshot(stream_req()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // Second call must block on the single permit. A short timeout proves it is
+    // queued, not served, while the first stream holds the only permit.
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        app.clone().oneshot(stream_req()),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "second call should block while the only permit is held by the first stream"
+    );
+
+    // Drop the first response (and thus its body stream) -> permit released.
+    drop(first);
+
+    // Now the second call is admitted and completes.
+    let second = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        app.clone().oneshot(stream_req()),
+    )
+    .await
+    .expect("second call should proceed once the permit is released")
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
 }

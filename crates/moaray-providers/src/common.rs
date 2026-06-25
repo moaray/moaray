@@ -11,10 +11,21 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Map an upstream HTTP status into the canonical error matrix. `Ok(())` means
 /// the status is a success the caller should relay as-is.
+///
+/// The 4xx-vs-5xx split is load-bearing for the circuit breaker (plan P3-2): a
+/// 4xx means the upstream is up and answering (the fault is the request's or the
+/// upstream credential/config), so it maps to the breaker-neutral
+/// [`Error::UpstreamClientError`]; a 429 maps to [`Error::UpstreamRateLimited`]
+/// (throttling, also breaker-neutral); only a server-class 5xx maps to
+/// [`Error::UpstreamError`], which counts against the breaker. The client-facing
+/// envelope for 4xx/5xx is identical (502 `upstream_error`) so upstream
+/// internals never leak — only the breaker classification differs (see
+/// [`Error::counts_against_breaker`]).
 pub fn map_upstream_status(status: u16) -> Result<(), Error> {
     match status {
         s if (200..300).contains(&s) => Ok(()),
         429 => Err(Error::UpstreamRateLimited),
+        s if (400..500).contains(&s) => Err(Error::UpstreamClientError),
         _ => Err(Error::UpstreamError),
     }
 }
