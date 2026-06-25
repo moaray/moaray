@@ -12,9 +12,10 @@ use url::Url;
 
 use crate::error::ConfigError;
 use crate::runtime::{
-    KeyConfig, KeySecret, ModelConfig, RecipeConfig, RuntimeConfig, ServerConfig,
+    BreakerConfig, KeyConfig, KeySecret, ModelConfig, RateLimit, RecipeConfig, RetryConfig,
+    RuntimeConfig, ServerConfig,
 };
-use crate::schema::ConfigDoc;
+use crate::schema::{ConfigDoc, RateLimitDoc};
 
 /// Resolver for environment values. Injectable so tests don't touch real env.
 pub trait EnvSource {
@@ -44,6 +45,28 @@ fn valid_base_url(model: &str, raw: &str) -> Result<String, ConfigError> {
     }
 }
 
+fn valid_rate_limit(
+    scope: &'static str,
+    name: &str,
+    doc: Option<RateLimitDoc>,
+) -> Result<Option<RateLimit>, ConfigError> {
+    match doc {
+        None => Ok(None),
+        Some(rl) => {
+            if rl.rps < 1 {
+                return Err(ConfigError::BadRateLimit {
+                    scope,
+                    name: name.to_string(),
+                });
+            }
+            // burst defaults to rps (one second of capacity) and is floored at
+            // rps so a single allowed request can never be starved by burst=0.
+            let burst = rl.burst.unwrap_or(rl.rps).max(rl.rps);
+            Ok(Some(RateLimit { rps: rl.rps, burst }))
+        }
+    }
+}
+
 /// Validate a parsed [`ConfigDoc`], producing a [`RuntimeConfig`].
 pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, ConfigError> {
     if doc.models.is_empty() {
@@ -58,6 +81,7 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
         }
         let base_url = valid_base_url(&m.name, &m.base_url)?;
         let upstream_id = m.upstream_id.clone().unwrap_or_else(|| m.name.clone());
+        let rate_limit = valid_rate_limit("model", &m.name, m.rate_limit)?;
         models.insert(
             m.name.clone(),
             ModelConfig {
@@ -66,6 +90,8 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
                 base_url,
                 api_key_env: m.api_key_env,
                 upstream_id,
+                rate_limit,
+                max_concurrency: m.max_concurrency,
             },
         );
     }
@@ -87,6 +113,7 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
         if k.allow_models.is_empty() {
             return Err(ConfigError::EmptyAllowlist(k.id));
         }
+        let rate_limit = valid_rate_limit("key", &k.id, k.rate_limit)?;
         // Note: an allowlist entry need NOT be a currently-configured model.
         // The allowlist is authorization policy and is intentionally decoupled
         // from the model registry: a key may be authorized for a model that the
@@ -96,6 +123,7 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
             id: k.id,
             secret,
             allow_models: k.allow_models,
+            rate_limit,
         });
     }
 
@@ -149,6 +177,16 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
         shutdown_grace_ms: doc.server.shutdown_grace_ms,
         default_max_tokens: doc.server.default_max_tokens,
         moa_expose_metadata: doc.server.moa_expose_metadata,
+        breaker: BreakerConfig {
+            failure_threshold: doc.server.breaker.failure_threshold,
+            open_ms: doc.server.breaker.open_ms,
+            half_open_successes: doc.server.breaker.half_open_successes,
+        },
+        retry: RetryConfig {
+            enabled: doc.server.retry.enabled,
+            max_retries: doc.server.retry.max_retries,
+            backoff_ms: doc.server.retry.backoff_ms,
+        },
     };
 
     Ok(RuntimeConfig {

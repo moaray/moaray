@@ -17,15 +17,28 @@ use moaray_core::provider::Provider;
 use moaray_moa::{MapResolver, Orchestrator, Recipe, Strategy as MoaStrategy};
 use moaray_providers::{build_client, AnthropicProvider, OpenAiProvider};
 
+use crate::governed::GovernedProvider;
+use crate::runtime::StatefulState;
+
 /// Build the model-name -> provider map from validated config.
-pub fn build_providers(config: &RuntimeConfig) -> HashMap<String, Arc<dyn Provider>> {
+///
+/// Every concrete adapter is wrapped in a [`GovernedProvider`] bound to the
+/// shared per-`upstream_id` slot in `stateful`. Because the orchestrator is
+/// built from this same map (see [`build_orchestrator`]), a MoA arm and a
+/// passthrough call to the same model share one breaker/limiter/semaphore — MoA
+/// fan-out cannot bypass the per-upstream cap (plan §1.4).
+pub fn build_providers(
+    config: &RuntimeConfig,
+    stateful: &StatefulState,
+) -> HashMap<String, Arc<dyn Provider>> {
     let client = build_client();
+    let retry = config.server.retry;
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     for (name, m) in &config.models {
         // Resolve upstream key from env at build time (empty if unset; the
         // upstream will reject, and we never log the value).
         let api_key = std::env::var(&m.api_key_env).unwrap_or_default();
-        let provider: Arc<dyn Provider> = match m.provider_type {
+        let inner: Arc<dyn Provider> = match m.provider_type {
             ProviderType::OpenaiCompat => Arc::new(OpenAiProvider::new(
                 m.upstream_id.clone(),
                 m.base_url.clone(),
@@ -39,6 +52,14 @@ pub fn build_providers(config: &RuntimeConfig) -> HashMap<String, Arc<dyn Provid
                 config.server.default_max_tokens,
                 client.clone(),
             )),
+        };
+        // Wrap with per-upstream governance (breaker/limiter/concurrency/retry),
+        // sharing the same stateful slot across passthrough + MoA.
+        let provider: Arc<dyn Provider> = match stateful.upstream(&m.upstream_id) {
+            Some(slot) => Arc::new(GovernedProvider::new(inner, slot, retry)),
+            // Should not happen (stateful is built from the same config); fall
+            // back to the raw provider rather than panicking.
+            None => inner,
         };
         providers.insert(name.clone(), provider);
     }

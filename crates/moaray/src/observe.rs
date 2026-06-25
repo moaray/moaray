@@ -36,11 +36,35 @@ pub fn status_class(status: u16) -> &'static str {
     }
 }
 
+/// Which gateway path served a request. Used as a fixed, low-cardinality
+/// histogram label so passthrough vs MoA latency is bucketed separately
+/// (plan P3-4) without ever leaking a high-cardinality value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPath {
+    Passthrough,
+    Moa,
+}
+
+impl RequestPath {
+    /// Stable, low-cardinality string for the `path` metric label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RequestPath::Passthrough => "passthrough",
+            RequestPath::Moa => "moa",
+        }
+    }
+}
+
 /// Record one request's outcome.
-pub fn record_request(model: &str, status: u16, latency_secs: f64) {
+///
+/// The latency histogram is bucketed by `path` (passthrough vs MoA) and `model`,
+/// both low-cardinality. No request-id / key / URL ever becomes a label
+/// (no-secret-logging + cardinality discipline; asserted by a metrics test).
+pub fn record_request(path: RequestPath, model: &str, status: u16, latency_secs: f64) {
     let class = status_class(status);
     metrics::counter!(
         "moaray_requests_total",
+        "path" => path.as_str(),
         "model" => model.to_string(),
         "status_class" => class
     )
@@ -48,6 +72,7 @@ pub fn record_request(model: &str, status: u16, latency_secs: f64) {
     if status >= 400 {
         metrics::counter!(
             "moaray_errors_total",
+            "path" => path.as_str(),
             "model" => model.to_string(),
             "status_class" => class
         )
@@ -55,6 +80,7 @@ pub fn record_request(model: &str, status: u16, latency_secs: f64) {
     }
     metrics::histogram!(
         "moaray_request_duration_seconds",
+        "path" => path.as_str(),
         "model" => model.to_string()
     )
     .record(latency_secs);

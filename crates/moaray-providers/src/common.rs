@@ -20,9 +20,18 @@ pub fn map_upstream_status(status: u16) -> Result<(), Error> {
 }
 
 /// Map a `reqwest::Error` (transport-level) into the canonical error.
+///
+/// The connect-vs-sent distinction is load-bearing for the retry policy (plan
+/// P3-2): a `connect`/DNS/TLS failure means the request **never left the
+/// gateway**, so it maps to the retry-safe [`Error::UpstreamUnavailable`].
+/// Anything else (the request was sent, then failed mid-flight) maps to
+/// [`Error::UpstreamError`], which is NOT retried by default to avoid
+/// double-charging a generation call.
 pub fn map_reqwest_error(e: &reqwest::Error) -> Error {
     if e.is_timeout() {
         Error::UpstreamTimeout
+    } else if e.is_connect() {
+        Error::UpstreamUnavailable
     } else {
         Error::UpstreamError
     }

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::{authenticate, parse_bearer};
 use crate::http_error::ApiError;
-use crate::observe::{record_moa_arm, record_request, render_metrics};
+use crate::observe::{record_moa_arm, record_request, render_metrics, RequestPath};
 use crate::runtime::AppState;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -138,6 +138,10 @@ async fn chat_completions(
     let rt = ctx.state.runtime();
     let auth = authenticate(&rt.config.keys, &token)?;
 
+    // Inbound per-key rate limit (429 rate_limited). Checked right after auth and
+    // before any body work, so an over-rate caller fails fast and cheap.
+    ctx.state.stateful.check_key_limit(&auth.key_id)?;
+
     // Read the body (bounded by DefaultBodyLimit; over-limit yields 413).
     let body = req.into_body();
     let raw = match axum::body::to_bytes(body, ctx.max_body_bytes).await {
@@ -238,12 +242,22 @@ async fn passthrough(
     match result {
         Ok(raw_resp) => {
             let status = raw_resp.status;
-            record_request(&model, status, started.elapsed().as_secs_f64());
+            record_request(
+                RequestPath::Passthrough,
+                &model,
+                status,
+                started.elapsed().as_secs_f64(),
+            );
             Ok(into_response(raw_resp, stream))
         }
         Err(e) => {
             let status = e.envelope().status;
-            record_request(&model, status, started.elapsed().as_secs_f64());
+            record_request(
+                RequestPath::Passthrough,
+                &model,
+                status,
+                started.elapsed().as_secs_f64(),
+            );
             Err(e.into())
         }
     }
@@ -293,7 +307,12 @@ async fn run_moa(
                 moa.aggregator.status.as_str(),
                 moa.aggregator.latency_ms as f64 / 1000.0,
             );
-            record_request(&model, 200, started.elapsed().as_secs_f64());
+            record_request(
+                RequestPath::Moa,
+                &model,
+                200,
+                started.elapsed().as_secs_f64(),
+            );
 
             let mut body = serde_json::to_value(&moa.response).unwrap_or_else(|_| json!({}));
             if ctx.moa_expose_metadata {
@@ -305,7 +324,12 @@ async fn run_moa(
         }
         Err(e) => {
             let status = e.envelope().status;
-            record_request(&model, status, started.elapsed().as_secs_f64());
+            record_request(
+                RequestPath::Moa,
+                &model,
+                status,
+                started.elapsed().as_secs_f64(),
+            );
             Err(e.into())
         }
     }

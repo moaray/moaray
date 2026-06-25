@@ -57,9 +57,13 @@ cargo clippy --workspace -- -D warnings
 
 ## Status
 
-🚧 Early. Phase 1 (passthrough MVP) and Phase 2 (MoA orchestration —
-fan-out + concat-synthesize / quorum-judge + quorum tolerance) implemented;
-production hardening (Phase 3) in progress. See `DESIGN.md` for the full spec.
+🚧 Early. Phase 1 (passthrough MVP), Phase 2 (MoA orchestration —
+fan-out + concat-synthesize / quorum-judge + quorum tolerance), and most of
+Phase 3 production hardening (per-key + per-upstream rate limiting, per-upstream
+concurrency caps, circuit breaker, conservative retry, full Prometheus
+observability, load-smoke + deploy doc) are implemented. Config hot-reload is the
+remaining Phase 3 item. See `DESIGN.md` for the full spec and `docs/DEPLOY.md`
+for deployment + the passthrough overhead baseline.
 
 ## License
 

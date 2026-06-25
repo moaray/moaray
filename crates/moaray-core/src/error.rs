@@ -50,6 +50,26 @@ pub enum Error {
     #[error("upstream rate limited")]
     UpstreamRateLimited,
 
+    /// Upstream could not be reached: the connection failed before the request
+    /// was sent (DNS / connect / TLS handshake). Client-facing envelope is
+    /// identical to [`Error::UpstreamError`] (502), but this variant is the only
+    /// **retry-safe** upstream failure — the generation request never left the
+    /// gateway, so retrying cannot double-charge or duplicate a side effect (see
+    /// [`Error::is_retryable`]). -> 502
+    #[error("upstream unavailable")]
+    UpstreamUnavailable,
+
+    /// The gateway's own per-key or per-upstream limiter rejected the request,
+    /// distinct from [`Error::UpstreamRateLimited`] (the upstream's own 429).
+    /// -> 429 rate_limit_error / rate_limited
+    #[error("rate limit exceeded")]
+    RateLimited,
+
+    /// The per-upstream circuit breaker is open after repeated failures; the
+    /// request fails fast instead of hammering a known-bad upstream. -> 503
+    #[error("upstream circuit breaker is open")]
+    CircuitOpen,
+
     /// A capability the v1 structured path does not support (e.g. tool_use).
     /// -> 400 invalid_request_error / unsupported
     #[error("unsupported: {0}")]
@@ -93,6 +113,9 @@ impl Error {
             Error::UpstreamTimeout => (504, TYPE_API_ERROR, "upstream_timeout"),
             Error::UpstreamError => (502, TYPE_API_ERROR, "upstream_error"),
             Error::UpstreamRateLimited => (429, TYPE_RATE_LIMIT, "upstream_rate_limited"),
+            Error::UpstreamUnavailable => (502, TYPE_API_ERROR, "upstream_error"),
+            Error::RateLimited => (429, TYPE_RATE_LIMIT, "rate_limited"),
+            Error::CircuitOpen => (503, TYPE_API_ERROR, "circuit_open"),
             Error::Unsupported(_) => (400, TYPE_INVALID_REQUEST, "unsupported"),
             Error::MoaStreamingUnsupported => {
                 (400, TYPE_INVALID_REQUEST, "moa_streaming_unsupported")
@@ -106,6 +129,20 @@ impl Error {
             code,
             message: self.to_string(),
         }
+    }
+
+    /// Whether retrying the request that produced this error is safe.
+    ///
+    /// **Only connection failures that happened before the request was sent are
+    /// retry-safe** ([`Error::UpstreamUnavailable`]). A generation request that
+    /// already reached the upstream ([`Error::UpstreamError`],
+    /// [`Error::UpstreamTimeout`], [`Error::UpstreamRateLimited`]) is NOT
+    /// retried by default: the upstream may have produced output and charged for
+    /// it, so a retry risks double-billing or a divergent answer (plan P3-2,
+    /// codex P1). The retry policy in the bin gates on this; streaming requests
+    /// are never retried regardless.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Error::UpstreamUnavailable)
     }
 }
 
@@ -134,6 +171,9 @@ mod tests {
             (Error::UpstreamTimeout, 504, "upstream_timeout"),
             (Error::UpstreamError, 502, "upstream_error"),
             (Error::UpstreamRateLimited, 429, "upstream_rate_limited"),
+            (Error::UpstreamUnavailable, 502, "upstream_error"),
+            (Error::RateLimited, 429, "rate_limited"),
+            (Error::CircuitOpen, 503, "circuit_open"),
             (
                 Error::MoaStreamingUnsupported,
                 400,
@@ -161,5 +201,19 @@ mod tests {
             Error::UpstreamRateLimited.envelope().error_type,
             TYPE_RATE_LIMIT
         );
+        assert_eq!(Error::RateLimited.envelope().error_type, TYPE_RATE_LIMIT);
+    }
+
+    #[test]
+    fn only_connect_failures_are_retryable() {
+        // Retry-safe: the request never left the gateway.
+        assert!(Error::UpstreamUnavailable.is_retryable());
+        // NOT retry-safe: the generation request may have reached the upstream
+        // and produced (billed) output — retrying risks double-charge.
+        assert!(!Error::UpstreamError.is_retryable());
+        assert!(!Error::UpstreamTimeout.is_retryable());
+        assert!(!Error::UpstreamRateLimited.is_retryable());
+        assert!(!Error::CircuitOpen.is_retryable());
+        assert!(!Error::Internal.is_retryable());
     }
 }

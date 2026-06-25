@@ -42,4 +42,7 @@ pub enum ConfigError {
 
     #[error("no models configured")]
     NoModels,
+
+    #[error("{scope} `{name}` rate_limit.rps must be >= 1")]
+    BadRateLimit { scope: &'static str, name: String },
 }

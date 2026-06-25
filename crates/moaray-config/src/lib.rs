@@ -9,7 +9,10 @@ pub mod schema;
 pub mod validate;
 
 pub use error::ConfigError;
-pub use runtime::{KeyConfig, KeySecret, ModelConfig, RecipeConfig, RuntimeConfig, ServerConfig};
+pub use runtime::{
+    BreakerConfig, KeyConfig, KeySecret, ModelConfig, RateLimit, RecipeConfig, RetryConfig,
+    RuntimeConfig, ServerConfig,
+};
 pub use schema::{ConfigDoc, ProviderType, Strategy};
 pub use validate::{validate, EnvSource, OsEnv};
 
@@ -199,5 +202,67 @@ models:
   - {name: gpt, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY}
 "#;
         assert!(matches!(reject(y), ConfigError::KeySecretShape(_)));
+    }
+
+    #[test]
+    fn parses_rate_limits_breaker_and_retry() {
+        let y = r#"
+server:
+  breaker: {failure_threshold: 3, open_ms: 5000, half_open_successes: 2}
+  retry: {enabled: true, max_retries: 1, backoff_ms: 50}
+auth:
+  keys:
+    - id: a
+      key_env: INBOUND_KEY
+      allow_models: [gpt]
+      rate_limit: {rps: 10}
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://x
+    api_key_env: OPENAI_KEY
+    rate_limit: {rps: 5, burst: 20}
+    max_concurrency: 4
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("valid");
+        // server breaker + retry
+        assert_eq!(cfg.server.breaker.failure_threshold, 3);
+        assert_eq!(cfg.server.breaker.open_ms, 5000);
+        assert_eq!(cfg.server.breaker.half_open_successes, 2);
+        assert!(cfg.server.retry.enabled);
+        assert_eq!(cfg.server.retry.max_retries, 1);
+        // per-key limit; burst defaults to rps when omitted
+        let kl = cfg.keys[0].rate_limit.expect("key limit");
+        assert_eq!(kl.rps, 10);
+        assert_eq!(kl.burst, 10);
+        // per-upstream limit + concurrency
+        let ml = cfg.models["gpt"].rate_limit.expect("model limit");
+        assert_eq!(ml.rps, 5);
+        assert_eq!(ml.burst, 20);
+        assert_eq!(cfg.models["gpt"].max_concurrency, Some(4));
+    }
+
+    #[test]
+    fn retry_off_and_no_limits_by_default() {
+        let cfg = load_yaml_with_env(VALID, &env()).expect("valid");
+        assert!(!cfg.server.retry.enabled);
+        assert!(cfg.keys[0].rate_limit.is_none());
+        assert!(cfg.models["gpt"].rate_limit.is_none());
+        assert!(cfg.models["gpt"].max_concurrency.is_none());
+        // sensible breaker defaults present even when unspecified
+        assert_eq!(cfg.server.breaker.failure_threshold, 5);
+    }
+
+    #[test]
+    fn rejects_zero_rps_rate_limit() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt], rate_limit: {rps: 0}}]}
+models:
+  - {name: gpt, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY}
+"#;
+        assert!(matches!(
+            reject(y),
+            ConfigError::BadRateLimit { scope: "key", .. }
+        ));
     }
 }

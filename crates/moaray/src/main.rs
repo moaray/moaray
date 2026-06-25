@@ -1,10 +1,11 @@
 //! moaray — server entrypoint. Loads config, builds the registry, assembles
 //! runtime + stateful layers, and serves the axum app with graceful shutdown.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use moaray::app::{build_router, ServerCtx};
-use moaray::runtime::{AppState, Runtime};
+use moaray::runtime::{AppState, Runtime, StatefulState};
 use moaray::{observe, registry};
 
 use anyhow::Context;
@@ -27,14 +28,17 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_grace = Duration::from_millis(config.server.shutdown_grace_ms);
     let moa_expose_metadata = config.server.moa_expose_metadata;
 
-    let providers = registry::build_providers(&config);
+    // Build the reload-surviving stateful layer FIRST so the provider registry
+    // can be wrapped against the same per-upstream slots the handlers read.
+    let stateful = Arc::new(StatefulState::from_config(&config));
+    let providers = registry::build_providers(&config, &stateful);
     let orchestrator = registry::build_orchestrator(&config, &providers);
     let runtime = Runtime {
         config,
         providers,
         orchestrator,
     };
-    let state = AppState::new(runtime);
+    let state = AppState::with_stateful(runtime, stateful);
     let metrics = observe::init_metrics();
 
     let ctx = ServerCtx {
