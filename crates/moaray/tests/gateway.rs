@@ -5,7 +5,7 @@ use std::time::Duration;
 use moaray::app::{build_router, ServerCtx};
 use moaray::observe::init_metrics;
 use moaray::registry;
-use moaray::runtime::{AppState, Runtime};
+use moaray::runtime::{AppState, Runtime, StatefulState};
 use tower::ServiceExt; // oneshot
 
 use axum::body::Body;
@@ -18,14 +18,15 @@ fn app_from_yaml(yaml: &str) -> axum::Router {
     let request_timeout = Duration::from_millis(config.server.request_timeout_ms);
     let max_body_bytes = config.server.max_body_bytes;
     let moa_expose_metadata = config.server.moa_expose_metadata;
-    let providers = registry::build_providers(&config);
+    let stateful = std::sync::Arc::new(StatefulState::from_config(&config));
+    let providers = registry::build_providers(&config, &stateful).expect("providers build");
     let orchestrator = registry::build_orchestrator(&config, &providers);
     let runtime = Runtime {
         config,
         providers,
         orchestrator,
     };
-    let state = AppState::new(runtime);
+    let state = AppState::with_stateful(runtime, stateful);
     let ctx = ServerCtx {
         state,
         metrics: init_metrics(),

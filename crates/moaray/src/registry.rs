@@ -12,20 +12,41 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::{anyhow, Result};
 use moaray_config::{ProviderType, RuntimeConfig, Strategy as CfgStrategy};
 use moaray_core::provider::Provider;
 use moaray_moa::{MapResolver, Orchestrator, Recipe, Strategy as MoaStrategy};
 use moaray_providers::{build_client, AnthropicProvider, OpenAiProvider};
 
+use crate::governed::GovernedProvider;
+use crate::runtime::StatefulState;
+
 /// Build the model-name -> provider map from validated config.
-pub fn build_providers(config: &RuntimeConfig) -> HashMap<String, Arc<dyn Provider>> {
+///
+/// Every concrete adapter is wrapped in a [`GovernedProvider`] bound to the
+/// shared per-`upstream_id` slot in `stateful`. Because the orchestrator is
+/// built from this same map (see [`build_orchestrator`]), a MoA arm and a
+/// passthrough call to the same model share one breaker/limiter/semaphore — MoA
+/// fan-out cannot bypass the per-upstream cap (plan §1.4).
+///
+/// **Fail-closed:** the per-upstream governance wrapper is load-bearing safety,
+/// so a missing `stateful` slot for a model's `upstream_id` is a hard build
+/// error, never a silent fall-back to the raw (unprotected) provider. `stateful`
+/// is built from the same config, so in normal wiring this never fires; it only
+/// guards future/reload callers (`build_providers` is `pub`) from accidentally
+/// installing a provider that has lost its breaker/limiter/concurrency.
+pub fn build_providers(
+    config: &RuntimeConfig,
+    stateful: &StatefulState,
+) -> Result<HashMap<String, Arc<dyn Provider>>> {
     let client = build_client();
+    let retry = config.server.retry;
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     for (name, m) in &config.models {
         // Resolve upstream key from env at build time (empty if unset; the
         // upstream will reject, and we never log the value).
         let api_key = std::env::var(&m.api_key_env).unwrap_or_default();
-        let provider: Arc<dyn Provider> = match m.provider_type {
+        let inner: Arc<dyn Provider> = match m.provider_type {
             ProviderType::OpenaiCompat => Arc::new(OpenAiProvider::new(
                 m.upstream_id.clone(),
                 m.base_url.clone(),
@@ -40,9 +61,21 @@ pub fn build_providers(config: &RuntimeConfig) -> HashMap<String, Arc<dyn Provid
                 client.clone(),
             )),
         };
+        // Wrap with per-upstream governance (breaker/limiter/concurrency/retry),
+        // sharing the same stateful slot across passthrough + MoA. A missing slot
+        // is fail-closed: never install a raw provider without its safety wrapper.
+        let slot = stateful.upstream(&m.upstream_id).ok_or_else(|| {
+            anyhow!(
+                "no stateful slot for upstream_id `{}` (model `{}`); refusing to build an \
+                 unprotected provider (fail-closed)",
+                m.upstream_id,
+                name
+            )
+        })?;
+        let provider: Arc<dyn Provider> = Arc::new(GovernedProvider::new(inner, slot, retry));
         providers.insert(name.clone(), provider);
     }
-    providers
+    Ok(providers)
 }
 
 /// Translate a validated config recipe into the orchestrator's own [`Recipe`].
@@ -82,4 +115,61 @@ pub fn build_orchestrator(
         .map(|(name, r)| (name.clone(), to_moa_recipe(r)))
         .collect();
     Orchestrator::new(resolver, recipes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::StatefulState;
+
+    struct E;
+    impl moaray_config::EnvSource for E {
+        fn get(&self, _k: &str) -> Option<String> {
+            None
+        }
+    }
+
+    const YAML: &str = r#"
+auth:
+  keys:
+    - id: a
+      key_env: INBOUND
+      allow_models: [gpt]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://x
+    api_key_env: UP
+    upstream_id: up-gpt
+"#;
+
+    /// P2 (rework R2): a model whose `upstream_id` has no stateful slot must make
+    /// `build_providers` FAIL (hard error), not silently install a raw provider
+    /// that has lost its breaker/limiter/concurrency wrapper (degrade-open).
+    #[test]
+    fn missing_stateful_slot_fails_closed() {
+        let config = moaray_config::load_yaml_with_env(YAML, &E).expect("valid config");
+        // An empty stateful layer has no slot for `up-gpt`.
+        let empty = StatefulState::default();
+        let err = match build_providers(&config, &empty) {
+            Ok(_) => panic!("must fail closed when the stateful slot is missing"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("fail-closed"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("up-gpt"),
+            "error should name the upstream: {msg}"
+        );
+    }
+
+    /// Contrast: with a stateful layer built from the same config, the slot exists
+    /// and the provider is built (and governed).
+    #[test]
+    fn present_stateful_slot_builds_governed_provider() {
+        let config = moaray_config::load_yaml_with_env(YAML, &E).expect("valid config");
+        let stateful = StatefulState::from_config(&config);
+        let providers = build_providers(&config, &stateful).expect("builds when slot present");
+        assert!(providers.contains_key("gpt"));
+    }
 }

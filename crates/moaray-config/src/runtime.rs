@@ -38,6 +38,33 @@ pub struct ServerConfig {
     /// Whether to emit the optional `moaray` MoA debug extension field. Off by
     /// default (production posture).
     pub moa_expose_metadata: bool,
+    /// Per-upstream circuit-breaker thresholds.
+    pub breaker: BreakerConfig,
+    /// Upstream retry policy (off unless explicitly enabled).
+    pub retry: RetryConfig,
+}
+
+/// Validated per-upstream circuit-breaker thresholds.
+#[derive(Debug, Clone, Copy)]
+pub struct BreakerConfig {
+    pub failure_threshold: u32,
+    pub open_ms: u64,
+    pub half_open_successes: u32,
+}
+
+/// Validated upstream retry policy.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    pub enabled: bool,
+    pub max_retries: u32,
+    pub backoff_ms: u64,
+}
+
+/// A validated token-bucket rate limit (sustained `rps` + `burst` capacity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub rps: u32,
+    pub burst: u32,
 }
 
 /// How a key's secret is verified.
@@ -65,6 +92,8 @@ pub struct KeyConfig {
     pub id: String,
     pub secret: KeySecret,
     pub allow_models: Vec<String>,
+    /// Optional inbound per-key rate limit.
+    pub rate_limit: Option<RateLimit>,
 }
 
 impl KeyConfig {
@@ -80,6 +109,7 @@ impl fmt::Debug for KeyConfig {
             .field("id", &self.id)
             .field("secret", &self.secret)
             .field("allow_models", &self.allow_models)
+            .field("rate_limit", &self.rate_limit)
             .finish()
     }
 }
@@ -93,6 +123,10 @@ pub struct ModelConfig {
     /// Env var name holding the upstream key (resolved at provider build time).
     pub api_key_env: String,
     pub upstream_id: String,
+    /// Optional per-upstream rate limit (shared across passthrough + MoA arms).
+    pub rate_limit: Option<RateLimit>,
+    /// Optional per-upstream concurrency cap. `None` means unbounded.
+    pub max_concurrency: Option<u32>,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -105,6 +139,8 @@ impl fmt::Debug for ModelConfig {
             .field("base_url", &self.base_url)
             .field("api_key_env", &self.api_key_env)
             .field("upstream_id", &self.upstream_id)
+            .field("rate_limit", &self.rate_limit)
+            .field("max_concurrency", &self.max_concurrency)
             .finish()
     }
 }

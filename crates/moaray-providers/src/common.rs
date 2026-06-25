@@ -11,18 +11,40 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Map an upstream HTTP status into the canonical error matrix. `Ok(())` means
 /// the status is a success the caller should relay as-is.
+///
+/// The breaker classification is load-bearing (plan P3-2): only a server-class
+/// **5xx** maps to the breaker-counting [`Error::UpstreamError`]. A 429 maps to
+/// [`Error::UpstreamRateLimited`] (throttling), and *every other* non-2xx status
+/// — 4xx client errors and any 1xx/3xx the gateway does not relay (e.g. a
+/// redirect from a base-URL mismatch) — maps to the breaker-neutral
+/// [`Error::UpstreamClientError`]: the upstream is reachable and answering, so it
+/// must not trip the shared per-upstream circuit. The client-facing envelope for
+/// 4xx/5xx/redirect is identical (502 `upstream_error`) so upstream internals
+/// never leak; only the breaker classification differs (see
+/// [`Error::counts_against_breaker`]).
 pub fn map_upstream_status(status: u16) -> Result<(), Error> {
     match status {
         s if (200..300).contains(&s) => Ok(()),
         429 => Err(Error::UpstreamRateLimited),
-        _ => Err(Error::UpstreamError),
+        s if s >= 500 => Err(Error::UpstreamError),
+        // 4xx, and any 1xx/3xx we don't relay: upstream is reachable -> neutral.
+        _ => Err(Error::UpstreamClientError),
     }
 }
 
 /// Map a `reqwest::Error` (transport-level) into the canonical error.
+///
+/// The connect-vs-sent distinction is load-bearing for the retry policy (plan
+/// P3-2): a `connect`/DNS/TLS failure means the request **never left the
+/// gateway**, so it maps to the retry-safe [`Error::UpstreamUnavailable`].
+/// Anything else (the request was sent, then failed mid-flight) maps to
+/// [`Error::UpstreamError`], which is NOT retried by default to avoid
+/// double-charging a generation call.
 pub fn map_reqwest_error(e: &reqwest::Error) -> Error {
     if e.is_timeout() {
         Error::UpstreamTimeout
+    } else if e.is_connect() {
+        Error::UpstreamUnavailable
     } else {
         Error::UpstreamError
     }
@@ -74,4 +96,48 @@ fn relay_stream_inner(resp: reqwest::Response) -> ByteStream {
             })
         });
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_upstream_status_classifies_for_breaker() {
+        // 2xx is success.
+        assert!(map_upstream_status(200).is_ok());
+        assert!(map_upstream_status(204).is_ok());
+        // 429 -> throttling (breaker-neutral).
+        assert!(matches!(
+            map_upstream_status(429),
+            Err(Error::UpstreamRateLimited)
+        ));
+        // 4xx -> client error (breaker-neutral).
+        for s in [400u16, 401, 403, 404, 422] {
+            assert!(
+                matches!(map_upstream_status(s), Err(Error::UpstreamClientError)),
+                "status {s} should be UpstreamClientError"
+            );
+        }
+        // 3xx redirects we don't relay are also breaker-neutral (upstream is up).
+        assert!(matches!(
+            map_upstream_status(301),
+            Err(Error::UpstreamClientError)
+        ));
+        assert!(matches!(
+            map_upstream_status(308),
+            Err(Error::UpstreamClientError)
+        ));
+        // 5xx -> genuine upstream-health fault (counts against breaker).
+        for s in [500u16, 502, 503, 504] {
+            assert!(
+                matches!(map_upstream_status(s), Err(Error::UpstreamError)),
+                "status {s} should be UpstreamError"
+            );
+        }
+        // Breaker classification matches the policy.
+        assert!(!Error::UpstreamClientError.counts_against_breaker());
+        assert!(!Error::UpstreamRateLimited.counts_against_breaker());
+        assert!(Error::UpstreamError.counts_against_breaker());
+    }
 }

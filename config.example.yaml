@@ -7,12 +7,26 @@ server:
   shutdown_grace_ms: 15000
   default_max_tokens: 4096     # injected for anthropic when caller omits it
   moa_expose_metadata: false   # emit the `moaray` per-arm debug field (off in prod)
+  # Per-upstream circuit breaker (applied per upstream_id). Defaults shown.
+  breaker:
+    failure_threshold: 5       # consecutive failures that trip the breaker open
+    open_ms: 30000             # cool-down before a half-open probe is allowed
+    half_open_successes: 1     # consecutive probe successes needed to close again
+  # Upstream retry policy. OFF by default: a generation request is not naturally
+  # idempotent, so opt in deliberately. Even enabled, ONLY connect failures
+  # (request never sent) are retried, and streaming is never retried.
+  retry:
+    enabled: false
+    max_retries: 2
+    backoff_ms: 100            # doubles each attempt
 
 auth:
   keys:
     - id: local-dev
       key_env: MOARAY_INBOUND_KEY   # bearer token callers must present
       allow_models: [mock-gpt, "moa/arm-e"]
+      # Optional inbound per-key token-bucket limit (omit for unlimited).
+      # rate_limit: {rps: 50, burst: 100}
 
 models:
   - name: mock-gpt
@@ -20,6 +34,10 @@ models:
     base_url: http://mock-upstream:9000   # docker-compose service
     api_key_env: MOCK_UPSTREAM_KEY
     upstream_id: mock-gpt
+    # Optional per-upstream limits, shared by passthrough + MoA arms that resolve
+    # to this upstream_id (MoA fan-out cannot bypass them).
+    # rate_limit: {rps: 100, burst: 200}
+    # max_concurrency: 64                 # in-flight request ceiling
 
 # MoA recipes: fan-out to the proposers in parallel, then fuse with the
 # aggregator. Activated in Phase 2. Call them via `model: "moa/<recipe>"`.

@@ -42,4 +42,19 @@ pub enum ConfigError {
 
     #[error("no models configured")]
     NoModels,
+
+    #[error("{scope} `{name}` rate_limit.rps must be >= 1")]
+    BadRateLimit { scope: &'static str, name: String },
+
+    #[error(
+        "models `{first}` and `{second}` share upstream_id `{upstream_id}` but declare conflicting \
+         {field}; per-upstream governance (rate_limit/max_concurrency) must be identical for every \
+         model on one upstream_id"
+    )]
+    ConflictingUpstreamGovernance {
+        upstream_id: String,
+        first: String,
+        second: String,
+        field: &'static str,
+    },
 }

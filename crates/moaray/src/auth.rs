@@ -158,12 +158,14 @@ mod tests {
                 id: "plain-key".into(),
                 secret: KeySecret::Plain("sk-secret".into()),
                 allow_models: vec!["gpt".into()],
+                rate_limit: None,
             },
             KeyConfig {
                 id: "hash-key".into(),
                 // sha256("sk-hashed")
                 secret: KeySecret::Sha256(sha256::digest(b"sk-hashed")),
                 allow_models: vec!["opus".into()],
+                rate_limit: None,
             },
         ]
     }

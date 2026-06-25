@@ -53,6 +53,9 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 # Config / hot-reload primitives
 arc-swap = "1"
 
+# Rate limiting (per-key + per-upstream token buckets)
+governor = "0.10"
+
 # Misc
 uuid = { version = "1", features = ["v4"] }
 url = "2"

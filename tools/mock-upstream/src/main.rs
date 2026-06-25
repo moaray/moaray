@@ -2,6 +2,12 @@
 //! docker-compose quickstart and local testing. It implements just enough of
 //! `/v1/chat/completions` to exercise moaray's passthrough path (non-stream and
 //! SSE stream) without any real provider credentials.
+//!
+//! For the load-smoke benchmark it can inject a fixed per-request delay via the
+//! `MOCK_DELAY_MS` env var, so measured added-overhead reflects moaray's cost on
+//! top of a *stable* upstream latency rather than upstream jitter.
+
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::Json;
@@ -23,7 +29,20 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Fixed delay injected before responding, from `MOCK_DELAY_MS` (default 0).
+fn injected_delay() -> Duration {
+    let ms = std::env::var("MOCK_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    Duration::from_millis(ms)
+}
+
 async fn chat(Json(req): Json<Value>) -> Response {
+    let delay = injected_delay();
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let model = req
         .get("model")
         .and_then(Value::as_str)

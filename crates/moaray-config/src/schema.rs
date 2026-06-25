@@ -40,6 +40,96 @@ pub struct ServerDoc {
     /// responses. **Off by default** (production posture); enable for debugging.
     #[serde(default)]
     pub moa_expose_metadata: bool,
+    /// Per-upstream circuit-breaker defaults (applied per `upstream_id`).
+    #[serde(default)]
+    pub breaker: BreakerDoc,
+    /// Upstream retry defaults. Retries are **off** unless explicitly enabled.
+    #[serde(default)]
+    pub retry: RetryDoc,
+}
+
+/// Per-upstream circuit-breaker tuning. State is kept per `upstream_id` and
+/// survives config reloads (see runtime `StatefulState`); these knobs only set
+/// the thresholds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BreakerDoc {
+    /// Consecutive upstream failures that trip the breaker open.
+    #[serde(default = "default_breaker_failure_threshold")]
+    pub failure_threshold: u32,
+    /// How long the breaker stays open before allowing a half-open probe (ms).
+    #[serde(default = "default_breaker_open_ms")]
+    pub open_ms: u64,
+    /// Consecutive half-open successes required to close the breaker again.
+    #[serde(default = "default_breaker_half_open_successes")]
+    pub half_open_successes: u32,
+}
+
+impl Default for BreakerDoc {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_breaker_failure_threshold(),
+            open_ms: default_breaker_open_ms(),
+            half_open_successes: default_breaker_half_open_successes(),
+        }
+    }
+}
+
+fn default_breaker_failure_threshold() -> u32 {
+    5
+}
+fn default_breaker_open_ms() -> u64 {
+    30_000
+}
+fn default_breaker_half_open_successes() -> u32 {
+    1
+}
+
+/// Upstream retry policy. **Conservative by design** (plan P3-2): even when
+/// enabled, retries only ever apply to connection failures that happened before
+/// the request was sent, and streaming requests are never retried.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryDoc {
+    /// Master switch. Off by default — a generation request is not naturally
+    /// idempotent, so opting in is a deliberate choice.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum retry attempts (in addition to the first try).
+    #[serde(default = "default_retry_max")]
+    pub max_retries: u32,
+    /// Base backoff between attempts (ms); doubles each attempt.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub backoff_ms: u64,
+}
+
+impl Default for RetryDoc {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_retries: default_retry_max(),
+            backoff_ms: default_retry_backoff_ms(),
+        }
+    }
+}
+
+fn default_retry_max() -> u32 {
+    2
+}
+fn default_retry_backoff_ms() -> u64 {
+    100
+}
+
+/// A token-bucket rate limit: sustained `rps` requests/second with a `burst`
+/// allowance. Used for both per-key (inbound) and per-upstream limits.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitDoc {
+    /// Sustained requests per second.
+    pub rps: u32,
+    /// Burst capacity (max tokens). Defaults to `rps` when omitted.
+    #[serde(default)]
+    pub burst: Option<u32>,
 }
 
 impl Default for ServerDoc {
@@ -52,6 +142,8 @@ impl Default for ServerDoc {
             shutdown_grace_ms: default_shutdown_grace_ms(),
             default_max_tokens: default_max_tokens(),
             moa_expose_metadata: false,
+            breaker: BreakerDoc::default(),
+            retry: RetryDoc::default(),
         }
     }
 }
@@ -100,6 +192,10 @@ pub struct KeyDoc {
     pub key_sha256: Option<String>,
     /// Model names this key may call. Empty is rejected by validate().
     pub allow_models: Vec<String>,
+    /// Optional inbound rate limit for this key. When set, requests presenting
+    /// this key are token-bucket limited; over-limit yields 429 `rate_limited`.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitDoc>,
 }
 
 /// A configured upstream model.
@@ -117,6 +213,14 @@ pub struct ModelDoc {
     /// Stable id for stateful keying (limiter/breaker). Defaults to `name`.
     #[serde(default)]
     pub upstream_id: Option<String>,
+    /// Optional per-upstream rate limit. Shared by passthrough and MoA arms that
+    /// resolve to the same `upstream_id` (MoA fan-out cannot bypass it).
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitDoc>,
+    /// Optional per-upstream concurrency cap (in-flight request ceiling). Shared
+    /// across passthrough + MoA via `upstream_id`. `None` means unbounded.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
 }
 
 /// Supported provider adapter kinds.

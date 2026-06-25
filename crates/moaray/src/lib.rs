@@ -4,7 +4,10 @@
 
 pub mod app;
 pub mod auth;
+pub mod breaker;
+pub mod governed;
 pub mod http_error;
+pub mod limit;
 pub mod observe;
 pub mod registry;
 pub mod runtime;

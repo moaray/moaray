@@ -9,7 +9,10 @@ pub mod schema;
 pub mod validate;
 
 pub use error::ConfigError;
-pub use runtime::{KeyConfig, KeySecret, ModelConfig, RecipeConfig, RuntimeConfig, ServerConfig};
+pub use runtime::{
+    BreakerConfig, KeyConfig, KeySecret, ModelConfig, RateLimit, RecipeConfig, RetryConfig,
+    RuntimeConfig, ServerConfig,
+};
 pub use schema::{ConfigDoc, ProviderType, Strategy};
 pub use validate::{validate, EnvSource, OsEnv};
 
@@ -115,6 +118,62 @@ models:
         assert!(matches!(reject(y), ConfigError::DuplicateModel(_)));
     }
 
+    /// P2 (rework R2): two models sharing one `upstream_id` with divergent
+    /// `rate_limit` must be rejected at validation — otherwise `reconcile` keeps
+    /// the first-by-name model's limit and silently drops the other, so renaming
+    /// a model could weaken/disable the safety limit (order-dependent governance).
+    #[test]
+    fn rejects_conflicting_shared_upstream_rate_limit() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 1, burst: 1}}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 100, burst: 200}}
+"#;
+        assert!(matches!(
+            reject(y),
+            ConfigError::ConflictingUpstreamGovernance {
+                field: "rate_limit",
+                ..
+            }
+        ));
+    }
+
+    /// P2 sibling: divergent `max_concurrency` on a shared `upstream_id` is also
+    /// rejected (same silent-drop hazard).
+    #[test]
+    fn rejects_conflicting_shared_upstream_max_concurrency() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, max_concurrency: 1}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, max_concurrency: 64}
+"#;
+        assert!(matches!(
+            reject(y),
+            ConfigError::ConflictingUpstreamGovernance {
+                field: "max_concurrency",
+                ..
+            }
+        ));
+    }
+
+    /// Two models may still share an `upstream_id` when their per-upstream
+    /// governance is identical — that is the legitimate MoA/passthrough sharing
+    /// case and must stay accepted (order-independent).
+    #[test]
+    fn accepts_shared_upstream_with_identical_governance() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("identical shared governance is valid");
+        assert_eq!(cfg.models["m1"].upstream_id, "shared");
+        assert_eq!(cfg.models["m2"].upstream_id, "shared");
+    }
+
     #[test]
     fn allowlist_may_reference_an_unconfigured_model() {
         // The allowlist is authorization policy, decoupled from the model
@@ -199,5 +258,67 @@ models:
   - {name: gpt, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY}
 "#;
         assert!(matches!(reject(y), ConfigError::KeySecretShape(_)));
+    }
+
+    #[test]
+    fn parses_rate_limits_breaker_and_retry() {
+        let y = r#"
+server:
+  breaker: {failure_threshold: 3, open_ms: 5000, half_open_successes: 2}
+  retry: {enabled: true, max_retries: 1, backoff_ms: 50}
+auth:
+  keys:
+    - id: a
+      key_env: INBOUND_KEY
+      allow_models: [gpt]
+      rate_limit: {rps: 10}
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://x
+    api_key_env: OPENAI_KEY
+    rate_limit: {rps: 5, burst: 20}
+    max_concurrency: 4
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("valid");
+        // server breaker + retry
+        assert_eq!(cfg.server.breaker.failure_threshold, 3);
+        assert_eq!(cfg.server.breaker.open_ms, 5000);
+        assert_eq!(cfg.server.breaker.half_open_successes, 2);
+        assert!(cfg.server.retry.enabled);
+        assert_eq!(cfg.server.retry.max_retries, 1);
+        // per-key limit; burst defaults to rps when omitted
+        let kl = cfg.keys[0].rate_limit.expect("key limit");
+        assert_eq!(kl.rps, 10);
+        assert_eq!(kl.burst, 10);
+        // per-upstream limit + concurrency
+        let ml = cfg.models["gpt"].rate_limit.expect("model limit");
+        assert_eq!(ml.rps, 5);
+        assert_eq!(ml.burst, 20);
+        assert_eq!(cfg.models["gpt"].max_concurrency, Some(4));
+    }
+
+    #[test]
+    fn retry_off_and_no_limits_by_default() {
+        let cfg = load_yaml_with_env(VALID, &env()).expect("valid");
+        assert!(!cfg.server.retry.enabled);
+        assert!(cfg.keys[0].rate_limit.is_none());
+        assert!(cfg.models["gpt"].rate_limit.is_none());
+        assert!(cfg.models["gpt"].max_concurrency.is_none());
+        // sensible breaker defaults present even when unspecified
+        assert_eq!(cfg.server.breaker.failure_threshold, 5);
+    }
+
+    #[test]
+    fn rejects_zero_rps_rate_limit() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt], rate_limit: {rps: 0}}]}
+models:
+  - {name: gpt, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY}
+"#;
+        assert!(matches!(
+            reject(y),
+            ConfigError::BadRateLimit { scope: "key", .. }
+        ));
     }
 }
