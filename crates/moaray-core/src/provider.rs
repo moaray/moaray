@@ -51,6 +51,16 @@ pub struct RawResponse {
     pub body: ByteStream,
 }
 
+impl std::fmt::Debug for RawResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawResponse")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("body", &"<stream>")
+            .finish()
+    }
+}
+
 /// Boxed byte stream used for streaming bodies.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
