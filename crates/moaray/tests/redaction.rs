@@ -86,13 +86,20 @@ models:
     let config = moaray_config::load_yaml(&yaml).expect("valid config");
     let request_timeout = Duration::from_millis(config.server.request_timeout_ms);
     let max_body_bytes = config.server.max_body_bytes;
+    let moa_expose_metadata = config.server.moa_expose_metadata;
     let providers = registry::build_providers(&config);
-    let runtime = Runtime { config, providers };
+    let orchestrator = registry::build_orchestrator(&config, &providers);
+    let runtime = Runtime {
+        config,
+        providers,
+        orchestrator,
+    };
     let app = build_router(ServerCtx {
         state: AppState::new(runtime),
         metrics: init_metrics(),
         request_timeout,
         max_body_bytes,
+        moa_expose_metadata,
     });
 
     // Install the capturing subscriber for this thread; awaits run on the

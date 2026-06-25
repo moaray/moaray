@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::{authenticate, parse_bearer};
 use crate::http_error::ApiError;
-use crate::observe::{record_request, render_metrics};
+use crate::observe::{record_moa_arm, record_request, render_metrics};
 use crate::runtime::AppState;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -36,6 +36,8 @@ pub struct ServerCtx {
     pub metrics: PrometheusHandle,
     pub request_timeout: Duration,
     pub max_body_bytes: usize,
+    /// Emit the optional `moaray` MoA debug extension field. Off in prod.
+    pub moa_expose_metadata: bool,
 }
 
 /// Build the axum router with all middleware applied.
@@ -163,19 +165,54 @@ async fn chat_completions(
 
     // route by model name
     let target = route(&model, |m| rt.config.is_known_model(m));
-    let provider = match target {
+    match target {
         RouteTarget::Passthrough { model } => {
-            rt.provider(&model).ok_or(Error::ModelNotFound { model })?
+            let provider = rt.provider(&model).ok_or_else(|| Error::ModelNotFound {
+                model: model.clone(),
+            })?;
+            drop(rt);
+            passthrough(ctx, request_id, auth, raw, model, stream, started, provider).await
         }
-        RouteTarget::Moa { .. } => {
-            // Phase 2 wires the orchestrator; v1 passthrough build rejects clearly.
-            return Err(Error::Unsupported("MoA mode arrives in Phase 2".into()).into());
+        RouteTarget::Moa { recipe } => {
+            // v1 MoA is non-streaming only (DESIGN §4): reject stream up front.
+            if stream {
+                return Err(Error::MoaStreamingUnsupported.into());
+            }
+            drop(rt);
+            // Own the runtime Arc across the (awaited) fan-out instead of holding
+            // the ArcSwap guard.
+            let runtime = ctx.state.runtime.load_full();
+            run_moa(
+                ctx,
+                runtime,
+                request_id,
+                auth.key_id.clone(),
+                recipe,
+                raw,
+                model,
+                started,
+            )
+            .await
         }
-        RouteTarget::Unknown { model } => return Err(Error::ModelNotFound { model }.into()),
-    };
+        RouteTarget::Unknown { model } => Err(Error::ModelNotFound { model }.into()),
+    }
+}
 
+/// Passthrough path (extracted from the router branch): forward raw bytes to the
+/// resolved upstream under the per-request timeout.
+#[allow(clippy::too_many_arguments)]
+async fn passthrough(
+    ctx: ServerCtx,
+    request_id: String,
+    auth: crate::auth::AuthContext,
+    raw: Bytes,
+    model: String,
+    stream: bool,
+    started: Instant,
+    provider: std::sync::Arc<dyn moaray_core::provider::Provider>,
+) -> Result<Response, ApiError> {
     let rctx = ReqCtx {
-        request_id: request_id.clone(),
+        request_id,
         deadline: Instant::now() + ctx.request_timeout,
         caller_key_id: auth.key_id.clone(),
         model: model.clone(),
@@ -210,6 +247,87 @@ async fn chat_completions(
             Err(e.into())
         }
     }
+}
+
+/// MoA path: parse the full request, run the orchestrator, render the single
+/// fused completion (usage summed), record per-arm metrics, and — only when the
+/// config toggle is on — attach the `moaray` debug extension field.
+#[allow(clippy::too_many_arguments)]
+async fn run_moa(
+    ctx: ServerCtx,
+    runtime: std::sync::Arc<crate::runtime::Runtime>,
+    request_id: String,
+    caller_key_id: String,
+    recipe: String,
+    raw: Bytes,
+    model: String,
+    started: Instant,
+) -> Result<Response, ApiError> {
+    // Parse the full structured request (MoA uses the typed chat() path).
+    let request: moaray_core::types::ChatRequest = serde_json::from_slice(&raw)
+        .map_err(|e| Error::BadRequest(format!("invalid request: {e}")))?;
+
+    let rctx = ReqCtx {
+        request_id,
+        deadline: Instant::now() + ctx.request_timeout,
+        caller_key_id,
+        model: model.clone(),
+    };
+
+    let result = runtime.orchestrator.run(&rctx, &recipe, request).await;
+
+    match result {
+        Ok(moa) => {
+            // Per-arm metrics (proposers + aggregator); low-cardinality labels.
+            for arm in &moa.arms {
+                record_moa_arm(
+                    &arm.model,
+                    &arm.upstream_id,
+                    arm.status.as_str(),
+                    arm.latency_ms as f64 / 1000.0,
+                );
+            }
+            record_moa_arm(
+                &moa.aggregator.model,
+                &moa.aggregator.upstream_id,
+                moa.aggregator.status.as_str(),
+                moa.aggregator.latency_ms as f64 / 1000.0,
+            );
+            record_request(&model, 200, started.elapsed().as_secs_f64());
+
+            let mut body = serde_json::to_value(&moa.response).unwrap_or_else(|_| json!({}));
+            if ctx.moa_expose_metadata {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("moaray".to_string(), moa_metadata(&moa));
+                }
+            }
+            Ok(axum::Json(body).into_response())
+        }
+        Err(e) => {
+            let status = e.envelope().status;
+            record_request(&model, status, started.elapsed().as_secs_f64());
+            Err(e.into())
+        }
+    }
+}
+
+/// Build the optional `moaray` extension object: per-arm metadata (model,
+/// upstream_id, latency, status). No secrets, no raw upstream error bodies.
+fn moa_metadata(moa: &moaray_moa::MoaResult) -> Value {
+    let arm_json = |a: &moaray_moa::ArmOutcome| {
+        json!({
+            "model": a.model,
+            "upstream_id": a.upstream_id,
+            "latency_ms": a.latency_ms,
+            "status": a.status.as_str(),
+            "usage_present": a.usage_present,
+        })
+    };
+    let arms: Vec<Value> = moa.arms.iter().map(arm_json).collect();
+    json!({
+        "arms": arms,
+        "aggregator": arm_json(&moa.aggregator),
+    })
 }
 
 /// Convert a provider [`RawResponse`] into an axum streaming response. The body

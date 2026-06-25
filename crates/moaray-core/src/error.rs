@@ -55,6 +55,15 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// MoA mode does not support streaming in v1 (`model: moa/*` + `stream:true`).
+    /// -> 400 invalid_request_error / moa_streaming_unsupported
+    #[error("MoA mode does not support streaming responses")]
+    MoaStreamingUnsupported,
+
+    /// Too few proposer arms succeeded to meet the recipe quorum. -> 503
+    #[error("MoA quorum not met: {succeeded}/{required} proposer arms succeeded")]
+    MoaQuorumFailed { succeeded: usize, required: usize },
+
     /// Anything else not safe to attribute to the client. -> 500
     #[error("internal error")]
     Internal,
@@ -85,6 +94,10 @@ impl Error {
             Error::UpstreamError => (502, TYPE_API_ERROR, "upstream_error"),
             Error::UpstreamRateLimited => (429, TYPE_RATE_LIMIT, "upstream_rate_limited"),
             Error::Unsupported(_) => (400, TYPE_INVALID_REQUEST, "unsupported"),
+            Error::MoaStreamingUnsupported => {
+                (400, TYPE_INVALID_REQUEST, "moa_streaming_unsupported")
+            }
+            Error::MoaQuorumFailed { .. } => (503, TYPE_API_ERROR, "moa_quorum_failed"),
             Error::Internal => (500, TYPE_API_ERROR, "internal_error"),
         };
         ErrorEnvelope {
@@ -121,6 +134,19 @@ mod tests {
             (Error::UpstreamTimeout, 504, "upstream_timeout"),
             (Error::UpstreamError, 502, "upstream_error"),
             (Error::UpstreamRateLimited, 429, "upstream_rate_limited"),
+            (
+                Error::MoaStreamingUnsupported,
+                400,
+                "moa_streaming_unsupported",
+            ),
+            (
+                Error::MoaQuorumFailed {
+                    succeeded: 1,
+                    required: 3,
+                },
+                503,
+                "moa_quorum_failed",
+            ),
         ];
         for (err, status, code) in cases {
             let env = err.envelope();

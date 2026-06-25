@@ -60,6 +60,27 @@ pub fn record_request(model: &str, status: u16, latency_secs: f64) {
     .record(latency_secs);
 }
 
+/// Record one MoA arm's outcome.
+///
+/// Labels are restricted to `model`, `upstream_id`, and `status_class` — all
+/// low-cardinality, non-secret values (no request-id, key, or URL ever becomes a
+/// label; see no-secret-logging rule).
+pub fn record_moa_arm(model: &str, upstream_id: &str, status_class: &str, latency_secs: f64) {
+    metrics::counter!(
+        "moaray_moa_arm_total",
+        "model" => model.to_string(),
+        "upstream_id" => upstream_id.to_string(),
+        "status_class" => status_class.to_string()
+    )
+    .increment(1);
+    metrics::histogram!(
+        "moaray_moa_arm_duration_seconds",
+        "model" => model.to_string(),
+        "upstream_id" => upstream_id.to_string()
+    )
+    .record(latency_secs);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

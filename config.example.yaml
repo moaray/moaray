@@ -6,12 +6,13 @@ server:
   max_body_bytes: 1048576      # 1 MiB inbound body cap
   shutdown_grace_ms: 15000
   default_max_tokens: 4096     # injected for anthropic when caller omits it
+  moa_expose_metadata: false   # emit the `moaray` per-arm debug field (off in prod)
 
 auth:
   keys:
     - id: local-dev
       key_env: MOARAY_INBOUND_KEY   # bearer token callers must present
-      allow_models: [mock-gpt]
+      allow_models: [mock-gpt, "moa/arm-e"]
 
 models:
   - name: mock-gpt
@@ -20,11 +21,12 @@ models:
     api_key_env: MOCK_UPSTREAM_KEY
     upstream_id: mock-gpt
 
-# MoA recipes are parsed/validated in Phase 1 but activated in Phase 2.
+# MoA recipes: fan-out to the proposers in parallel, then fuse with the
+# aggregator. Activated in Phase 2. Call them via `model: "moa/<recipe>"`.
 recipes:
   arm-e:
     proposers: [mock-gpt]
     aggregator: mock-gpt
-    strategy: concat-synthesize
+    strategy: concat-synthesize   # or quorum-judge
     arm_timeout_ms: 60000
-    quorum: 1
+    quorum: 1                      # proceed once >= quorum proposers succeed
