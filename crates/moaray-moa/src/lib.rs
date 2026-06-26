@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use moaray_core::provider::Provider;
 
-pub use orchestrator::{ArmOutcome, ArmStatus, MoaResult};
+pub use orchestrator::{ArmOutcome, ArmStatus, MoaResult, MoaRun};
 pub use recipe::{Recipe, Strategy};
 
 /// A resolver from model name to a concrete provider instance. The orchestrator

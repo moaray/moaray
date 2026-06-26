@@ -126,7 +126,7 @@ async fn fan_out_arm_spans_carry_main_request_id() {
         top_p: None,
         extra: Default::default(),
     };
-    orch.run(&rctx, "arm-e", req).await.unwrap();
+    orch.run(&rctx, "arm-e", req).await.unwrap().outcome.unwrap();
     drop(guard);
 
     let spans = recorder.0.lock().unwrap().clone();
