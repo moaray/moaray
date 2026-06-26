@@ -6,6 +6,7 @@ members = [
     "crates/moaray-providers",
     "crates/moaray-moa",
     "crates/moaray-config",
+    "crates/moaray-store",
     "tools/mock-upstream",
 ]
 
@@ -62,6 +63,12 @@ governor = "0.10"
 # Misc
 uuid = { version = "1", features = ["v4"] }
 url = "2"
+
+# Persistent usage store (v0.2-P1): bundled SQLite (compiles from C source so the
+# release image needs only a C toolchain — see DP1) + a lock-free bounded channel
+# for the hot-path try_send to the dedicated OS-thread writer.
+rusqlite = { version = "0.32", features = ["bundled"] }
+crossbeam-channel = "0.5"
 
 # Test deps
 wiremock = "0.6"
