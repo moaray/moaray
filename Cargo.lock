@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "moaray"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "moaray-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "moaray-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "moaray-moa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "moaray-providers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "moaray-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "metrics",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "mock-upstream"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "serde_json",

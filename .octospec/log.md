@@ -8,3 +8,4 @@ Chronological index of completed octospec tasks. One dated line per Finish.
 - 2026-06-26 — phase3-hot-reload — state-preserving SIGHUP reload, P0 (PR #8). [journal](journal/shared/phase3-hot-reload.md)
 - 2026-06-26 — octospec-backfill-journal — restore skipped Finish-phase artifacts (this PR).
 - 2026-06-26 — v0.2-usage-accounting — persistent per-arm request store + cost accounting (PR for #12). [journal](journal/shared/v0.2-usage-accounting.md)
+- 2026-06-26 — v0.2.0-release — version bump 0.1.0→0.2.0 + RELEASE notes (release收口, no functional change). [journal](journal/shared/v0.2.0-release.md)
