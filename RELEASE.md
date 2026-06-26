@@ -1,3 +1,87 @@
+# moaray v0.2.0 — Persistent usage/cost accounting
+
+**Date:** 2026-06-26
+**Status:** ✅ Production-ready
+
+v0.2.0 adds a persistent, per-arm request store with cost accounting on top of
+the v0.1.0 MoA gateway. Every upstream call (each MoA proposer, the aggregator,
+each non-stream passthrough) can be written to a SQLite store with raw token
+counts, a price snapshot, and a computed nano-USD cost — behind a `UsageSink`
+trait so the hot path only enqueues and never blocks. No functional changes to
+the gateway data path beyond this opt-in accounting seam.
+
+## New capability — persistent per-arm request store + cost accounting
+
+- **`UsageSink` trait** (`moaray-core`): the accounting seam. `UsageRecord` DTO
+  carries raw token counts + a price snapshot + a computed `cost_nano_usd`; all
+  fields are `Send` and **carry no secrets** (no api_key / token value / prompt or
+  response text / state_key).
+- **`moaray-store` crate** (new): `SqliteSink` writes via a **dedicated OS thread**
+  (rusqlite is sync — NOT `tokio::spawn`) draining a `crossbeam` bounded channel.
+  SQLite runs **WAL** (`synchronous=NORMAL`, `user_version=1`). Ships `NullSink`
+  (default, zero overhead) and `VecSink` (test util). `record()` is `try_send`
+  only.
+- **Cost model**: per-model `price_{prompt,completion}_per_mtok_usd` (USD/Mtok) →
+  integer nano-USD/Mtok at config validate; `compute_cost` is a pure helper using
+  i128 intermediates with round-half-up, returning `None` when tokens/price are
+  absent. Storing raw tokens + the price snapshot on every row means **cost is
+  always recomputable** after the fact.
+- **MoA boundary preserved**: `moaray-moa` never learns about sinks. `run()`
+  returns `MoaRun` so every post-fan-out path carries the arm outcomes; a failed
+  arm is recorded (`status=failed`, cost NULL), never silently dropped.
+
+## Posture
+
+**Best-effort, telemetry-grade visibility — NOT an invoice-grade ledger.** The
+hot path only `try_send`s onto a bounded channel drained by the OS-thread writer;
+under sustained overload rows are **dropped** (`moaray_usage_dropped_total`)
+rather than ever blocking or slowing a user request (**drop-not-block**). Because
+raw tokens + the price snapshot are persisted on every row, cost can be
+recomputed even if prices change later.
+
+## Acceptance gate (run on `release/v0.2.0`, base `main` @ 13ab87b, 2026-06-26)
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace` | ✅ **169 passed**, 0 failed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean (no warnings) |
+| `docker build .` | ✅ success (rusqlite-bundled compiles in the release image) |
+| E2E regression — 6 checkpoints (real outbound request, verify SQLite rows land) | ✅ green (YUJ-6037) |
+
+## Config
+
+```yaml
+server:
+  usage_store:
+    path: ./usage.db        # SQLite file path
+    channel_capacity: 4096  # bounded channel depth (try_send; full ⇒ drop)
+    batch_size: 64          # writer commit batch size
+```
+
+`server.usage_store` is **absent by default ⇒ `NullSink` (zero overhead)**. The
+block is **restart-frozen**: a hot reload that changes `usage_store` warns and
+keeps the running store (prices themselves remain hot-reloadable). Enabling
+accounting is opt-in and does not affect the gateway when absent.
+
+## Known limitations
+
+- **Streaming passthrough is not accounted** (usage tap is non-stream only). It is
+  made observable via the `moaray_usage_unaccounted_stream_total` counter.
+- **`scripts/load-smoke.sh` baseline measurement needs a fix** (tracked in #14);
+  the accounting overhead leg is present but the absolute numbers are not yet a
+  trustworthy committed baseline.
+- **Invoice-grade durability** (synchronous commit, reconciliation, `/v1/usage`
+  endpoint, dashboards, quotas, back-fill) is deferred to **v0.2-P2**.
+
+## Review trail
+- Plan: PLAN-full v2 (multica YUJ-5991), APPROVED over two /plan-eng-review rounds
+  (YUJ-5996 R1, YUJ-6016 R2).
+- Implementation: PR #13 (v0.2-P1 persistent accounting), merged to `main`.
+- E2E regression: YUJ-6037 (6 checkpoints, real request → SQLite landing verified).
+- All CI green (build-test + docker + octospec-lint).
+
+---
+
 # moaray v0.1.0 — Production Release
 
 **Date:** 2026-06-26
