@@ -205,8 +205,18 @@ impl ConfigReloader {
 
         // 5. publish: only now are new models routable, and their buckets already
         //    exist (steps 3-4) — no "provider without limiter" window.
+        //    `usage_store` is restart-frozen: the sink/writer in AppState stays the
+        //    startup one, so the PUBLISHED config must keep the previous
+        //    `usage_store` value (not the ignored new one). Otherwise the live
+        //    Runtime would advertise a store that is not the one actually being
+        //    written to, and the next reload's frozen-field diff would stop warning
+        //    about the real running store. (bind/port/shutdown_grace are also frozen
+        //    but inert post-startup; usage_store is the one whose drift is
+        //    observable, so we reconcile it here.)
+        let mut published_config = new_config.clone();
+        published_config.server.usage_store = prev_config.server.usage_store.clone();
         let new_runtime = Runtime {
-            config: new_config.clone(),
+            config: published_config,
             providers: plain,
             orchestrator,
         };
@@ -463,5 +473,33 @@ models:
             !changed3.contains(&"usage_store"),
             "identical store must not be flagged, got {changed3:?}"
         );
+    }
+
+    /// A reload that changes `usage_store` must PUBLISH the previous (running)
+    /// value, since the sink is process-lifetime — otherwise the live Runtime
+    /// would advertise a store it is not actually writing to, and the next
+    /// reload's frozen diff would stop warning.
+    #[tokio::test]
+    async fn reload_keeps_previous_usage_store_in_published_config() {
+        const V_STORE_A: &str = r#"
+server:
+  usage_store:
+    path: /tmp/store-a.db
+auth:
+  keys: [{id: team-a, key_env: INBOUND, allow_models: [a]}]
+models:
+  - {name: a, provider_type: openai-compat, base_url: https://a, api_key_env: KA}
+"#;
+        let v_a = cfg(V_STORE_A);
+        let reloader = reloader_for(&v_a);
+        // reload to a DIFFERENT store path (frozen — must be ignored at runtime).
+        let v_b = cfg(&V_STORE_A.replace("/tmp/store-a.db", "/tmp/store-b.db"));
+        reloader.apply_validated(&v_b).await.unwrap();
+
+        // The published runtime config must still name store-a (the running sink),
+        // NOT store-b, so the config never lies about the active store.
+        let live = reloader.state().runtime();
+        let store = live.config.server.usage_store.as_ref().expect("store kept");
+        assert_eq!(store.path, "/tmp/store-a.db", "frozen store value retained");
     }
 }
