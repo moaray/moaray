@@ -101,12 +101,48 @@ spec:
 Rolling restart: scale the new ReplicaSet up, wait for `readinessProbe`, then let
 the old pods receive SIGTERM and drain.
 
+## 4b. Config hot reload (SIGHUP)
+
+Send `SIGHUP` to reload `MOARAY_CONFIG` **without a restart**:
+
+```bash
+kill -HUP "$(pidof moaray)"   # or: docker kill --signal=HUP <container>
+```
+
+The reload is **state-preserving and all-or-nothing**:
+
+- **All-or-nothing** — the new file is fully validated first. On any error the
+  running config is kept and the failure is logged; the server never serves a
+  half-applied config (and an invalid edit can't take it down).
+- **State preserved** — per-upstream rate-limit buckets and circuit-breaker state
+  survive the reload for every upstream whose identity
+  (`provider_type|base_url|api_key_env`) is unchanged. A model rename or an
+  `upstream_id` relabel does **not** reset limits; changing a base_url or
+  `api_key_env` correctly starts a fresh bucket for the new identity.
+- **No protection gap** — new upstreams get their bucket/breaker installed
+  *before* they become routable, so there is never a "routable upstream without a
+  limiter" window, even under concurrent traffic during the swap.
+- **In-flight safe** — when a reload removes an upstream, requests already in
+  flight on the old config finish normally; the removed upstream's state is
+  garbage-collected only after a drain window.
+
+**Hot fields** (take effect immediately on reload): `server.request_timeout_ms`,
+`server.max_body_bytes`, `server.moa_expose_metadata`, and the whole
+`models` / `recipes` / `auth.keys` set. **Restart-only fields** (a reload logs a
+warning and keeps the running value): `server.bind`, `server.port`,
+`server.shutdown_grace_ms`. Unchanged upstreams keep their warm connection pool
+across a reload (only changed models are rebuilt), so editing one model does not
+trigger a reconnect storm.
+
 ## 5. Resilience knobs in production
 
 - **Rate limiting** — set `auth.keys[].rate_limit` (per tenant/key) and
   `models[].rate_limit` (protect each upstream). The per-upstream bucket is
-  **shared by passthrough and MoA arms** resolving to the same `upstream_id`, so
-  MoA fan-out cannot amplify traffic past an upstream's cap.
+  **shared by passthrough and MoA arms** resolving to the same upstream identity
+  (`provider_type|base_url|api_key_env`), so MoA fan-out — and any aliasing of one
+  upstream under different model names — cannot amplify traffic past an upstream's
+  cap. (The `upstream_id` field is only a low-cardinality metrics/label name; it
+  does not decide which models share a bucket.)
 - **Concurrency** — `models[].max_concurrency` caps in-flight requests per
   upstream; over-cap requests queue on a semaphore (and are cancelled on client
   disconnect / timeout).

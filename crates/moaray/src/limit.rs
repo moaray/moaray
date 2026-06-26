@@ -30,6 +30,10 @@ type Direct = GovRateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 /// One token-bucket limiter wrapping a validated [`RateLimit`].
 pub struct TokenBucket {
     inner: Direct,
+    /// The validated limit this bucket was built from. Kept so a config reload can
+    /// detect whether a per-key / per-upstream limit *value* changed (rebuild) or
+    /// is byte-identical (preserve the live bucket).
+    limit: RateLimit,
 }
 
 impl TokenBucket {
@@ -41,7 +45,13 @@ impl TokenBucket {
         let quota = Quota::per_second(rps).allow_burst(burst);
         Self {
             inner: GovRateLimiter::direct(quota),
+            limit,
         }
+    }
+
+    /// The validated limit this bucket enforces (for reload diffing).
+    pub fn limit(&self) -> RateLimit {
+        self.limit
     }
 
     /// Try to consume one token. `Err(RateLimited)` when the bucket is empty.

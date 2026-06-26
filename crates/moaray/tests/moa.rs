@@ -1,8 +1,6 @@
 //! End-to-end MoA orchestration tests: a real axum app in-process against
 //! wiremock upstreams, exercising fan-out -> aggregate -> single completion.
 
-use std::time::Duration;
-
 use moaray::app::{build_router, ServerCtx};
 use moaray::observe::init_metrics;
 use moaray::registry;
@@ -17,9 +15,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn app_from_yaml(yaml: &str) -> axum::Router {
     let config = moaray_config::load_yaml(yaml).expect("valid config");
-    let request_timeout = Duration::from_millis(config.server.request_timeout_ms);
-    let max_body_bytes = config.server.max_body_bytes;
-    let moa_expose_metadata = config.server.moa_expose_metadata;
     let stateful = std::sync::Arc::new(StatefulState::from_config(&config));
     let providers = registry::build_providers(&config, &stateful).expect("providers build");
     let orchestrator = registry::build_orchestrator(&config, &providers);
@@ -31,9 +26,6 @@ fn app_from_yaml(yaml: &str) -> axum::Router {
     build_router(ServerCtx {
         state: AppState::with_stateful(runtime, stateful),
         metrics: init_metrics(),
-        request_timeout,
-        max_body_bytes,
-        moa_expose_metadata,
     })
 }
 

@@ -10,4 +10,5 @@ pub mod http_error;
 pub mod limit;
 pub mod observe;
 pub mod registry;
+pub mod reload;
 pub mod runtime;

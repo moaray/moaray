@@ -52,6 +52,9 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Config / hot-reload primitives
 arc-swap = "1"
+# Concurrent map for the reload-surviving per-upstream state (in-place insert/GC
+# while requests are in flight).
+dashmap = "6"
 
 # Rate limiting (per-key + per-upstream token buckets)
 governor = "0.10"

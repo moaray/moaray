@@ -4,8 +4,6 @@
 //!
 //! Real axum app in-process against a wiremock upstream.
 
-use std::time::Duration;
-
 use moaray::app::{build_router, ServerCtx};
 use moaray::observe::init_metrics;
 use moaray::registry;
@@ -20,9 +18,6 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn app_from_yaml(yaml: &str) -> axum::Router {
     let config = moaray_config::load_yaml(yaml).expect("valid config");
-    let request_timeout = Duration::from_millis(config.server.request_timeout_ms);
-    let max_body_bytes = config.server.max_body_bytes;
-    let moa_expose_metadata = config.server.moa_expose_metadata;
     let stateful = std::sync::Arc::new(StatefulState::from_config(&config));
     let providers = registry::build_providers(&config, &stateful).expect("providers build");
     let orchestrator = registry::build_orchestrator(&config, &providers);
@@ -34,15 +29,17 @@ fn app_from_yaml(yaml: &str) -> axum::Router {
     build_router(ServerCtx {
         state: AppState::with_stateful(runtime, stateful),
         metrics: init_metrics(),
-        request_timeout,
-        max_body_bytes,
-        moa_expose_metadata,
     })
 }
 
 fn set_keys() {
     std::env::set_var("MOARAY_HARDEN_INBOUND", "sk-inbound");
     std::env::set_var("MOARAY_HARDEN_UPSTREAM", "sk-upstream");
+    // A second env var holding the SAME secret, used to give a model a distinct
+    // upstream *identity* (state_key = provider_type|base_url|api_key_env) while
+    // still hitting the same mock upstream — needed when a test wants two separate
+    // per-upstream buckets/breakers against one wiremock server.
+    std::env::set_var("MOARAY_HARDEN_UPSTREAM_ALT", "sk-upstream");
 }
 
 async fn mount_ok(server: &MockServer) {
@@ -187,7 +184,7 @@ models:
   - name: agg
     provider_type: openai-compat
     base_url: {uri}
-    api_key_env: MOARAY_HARDEN_UPSTREAM
+    api_key_env: MOARAY_HARDEN_UPSTREAM_ALT
     upstream_id: up-agg
 recipes:
   arm-e:
@@ -341,7 +338,7 @@ models:
   - name: agg
     provider_type: openai-compat
     base_url: {uri}
-    api_key_env: MOARAY_HARDEN_UPSTREAM
+    api_key_env: MOARAY_HARDEN_UPSTREAM_ALT
     upstream_id: up-agg
 recipes:
   arm-e:

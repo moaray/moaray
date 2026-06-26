@@ -47,9 +47,10 @@ pub enum ConfigError {
     BadRateLimit { scope: &'static str, name: String },
 
     #[error(
-        "models `{first}` and `{second}` share upstream_id `{upstream_id}` but declare conflicting \
-         {field}; per-upstream governance (rate_limit/max_concurrency) must be identical for every \
-         model on one upstream_id"
+        "models `{first}` and `{second}` resolve to the same upstream identity \
+         (provider_type|base_url|api_key_env, observability upstream_id `{upstream_id}`) but \
+         declare conflicting {field}; per-upstream governance (rate_limit/max_concurrency) must be \
+         identical for every model on one upstream identity"
     )]
     ConflictingUpstreamGovernance {
         upstream_id: String,

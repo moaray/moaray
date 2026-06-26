@@ -118,17 +118,22 @@ models:
         assert!(matches!(reject(y), ConfigError::DuplicateModel(_)));
     }
 
-    /// P2 (rework R2): two models sharing one `upstream_id` with divergent
+    /// P2 (rework R2) / P3-3: two models sharing one upstream identity
+    /// (`state_key` = provider_type|base_url|api_key_env) with divergent
     /// `rate_limit` must be rejected at validation — otherwise `reconcile` keeps
     /// the first-by-name model's limit and silently drops the other, so renaming
     /// a model could weaken/disable the safety limit (order-dependent governance).
+    /// Note: sharing is now decided by the identity triple, not the observability
+    /// `upstream_id`, so these two models share a bucket *because their
+    /// type+base_url+api_key_env match* (distinct `upstream_id` labels do not
+    /// separate them).
     #[test]
     fn rejects_conflicting_shared_upstream_rate_limit() {
         let y = r#"
 auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
 models:
-  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 1, burst: 1}}
-  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 100, burst: 200}}
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: label-1, rate_limit: {rps: 1, burst: 1}}
+  - {name: m2, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: label-2, rate_limit: {rps: 100, burst: 200}}
 "#;
         assert!(matches!(
             reject(y),
@@ -139,15 +144,15 @@ models:
         ));
     }
 
-    /// P2 sibling: divergent `max_concurrency` on a shared `upstream_id` is also
-    /// rejected (same silent-drop hazard).
+    /// P2 sibling: divergent `max_concurrency` on a shared upstream identity is
+    /// also rejected (same silent-drop hazard).
     #[test]
     fn rejects_conflicting_shared_upstream_max_concurrency() {
         let y = r#"
 auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
 models:
-  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, max_concurrency: 1}
-  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, max_concurrency: 64}
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, max_concurrency: 1}
+  - {name: m2, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, max_concurrency: 64}
 "#;
         assert!(matches!(
             reject(y),
@@ -158,20 +163,54 @@ models:
         ));
     }
 
-    /// Two models may still share an `upstream_id` when their per-upstream
-    /// governance is identical — that is the legitimate MoA/passthrough sharing
-    /// case and must stay accepted (order-independent).
+    /// Two models may still share an upstream identity (same
+    /// provider_type|base_url|api_key_env) when their per-upstream governance is
+    /// identical — that is the legitimate MoA/passthrough sharing case and must
+    /// stay accepted (order-independent), even with distinct `upstream_id` labels.
     #[test]
     fn accepts_shared_upstream_with_identical_governance() {
         let y = r#"
 auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
 models:
-  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
-  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY, upstream_id: shared, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
+  - {name: m2, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, rate_limit: {rps: 5, burst: 10}, max_concurrency: 8}
 "#;
         let cfg = load_yaml_with_env(y, &env()).expect("identical shared governance is valid");
-        assert_eq!(cfg.models["m1"].upstream_id, "shared");
-        assert_eq!(cfg.models["m2"].upstream_id, "shared");
+        // Same identity triple -> same internal state_key (shared bucket).
+        assert_eq!(cfg.models["m1"].state_key, cfg.models["m2"].state_key);
+        // upstream_id defaults to the model name (observability label, not a key).
+        assert_eq!(cfg.models["m1"].upstream_id, "m1");
+        assert_eq!(cfg.models["m2"].upstream_id, "m2");
+    }
+
+    /// P3-3 (P0-1): the internal `state_key` is derived from the identity triple
+    /// and is *independent* of both the model name and the observability
+    /// `upstream_id`. Renaming a model or relabeling `upstream_id` keeps the same
+    /// state_key (so limiter/breaker state is preserved on reload), while changing
+    /// base_url or api_key_env changes it (so a different account/host gets a fresh
+    /// bucket). base_url must never leak into the observability `upstream_id`.
+    #[test]
+    fn state_key_is_triple_derived_and_independent_of_labels() {
+        let y = r#"
+auth: {keys: [{id: a, key_env: INBOUND_KEY, allow_models: [m1]}]}
+models:
+  - {name: m1, provider_type: openai-compat, base_url: https://x, api_key_env: OPENAI_KEY, upstream_id: friendly}
+  - {name: m2, provider_type: openai-compat, base_url: https://y, api_key_env: OPENAI_KEY}
+  - {name: m3, provider_type: openai-compat, base_url: https://x, api_key_env: OTHER_KEY}
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("valid");
+        assert_eq!(
+            cfg.models["m1"].state_key,
+            "openai-compat|https://x|OPENAI_KEY"
+        );
+        // Different base_url -> different state_key (different upstream host).
+        assert_ne!(cfg.models["m1"].state_key, cfg.models["m2"].state_key);
+        // Same host but different api_key_env -> different state_key (account isolation).
+        assert_ne!(cfg.models["m1"].state_key, cfg.models["m3"].state_key);
+        // The observability upstream_id is the friendly label, NOT the triple,
+        // and never contains base_url (no-secret-logging / cardinality).
+        assert_eq!(cfg.models["m1"].upstream_id, "friendly");
+        assert!(!cfg.models["m1"].upstream_id.contains("https://x"));
     }
 
     #[test]

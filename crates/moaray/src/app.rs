@@ -32,25 +32,49 @@ use crate::runtime::AppState;
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Everything the server needs at runtime beyond [`AppState`].
+///
+/// The three "hot" server knobs — `request_timeout_ms`, `max_body_bytes`, and
+/// `moa_expose_metadata` — are deliberately **not** cached here. They are read
+/// from the live config snapshot ([`AppState::runtime`]) on each request so a
+/// config hot-reload takes effect immediately (P3-3 F2), instead of being frozen
+/// at startup. `bind` / `port` / `shutdown_grace_ms` are NOT hot (they need a
+/// restart); a reload warns and ignores changes to them (see [`crate::reload`]).
 #[derive(Clone)]
 pub struct ServerCtx {
     pub state: AppState,
     pub metrics: PrometheusHandle,
-    pub request_timeout: Duration,
-    pub max_body_bytes: usize,
-    /// Emit the optional `moaray` MoA debug extension field. Off in prod.
-    pub moa_expose_metadata: bool,
+}
+
+impl ServerCtx {
+    /// Live per-request timeout (hot-reloadable).
+    fn request_timeout(&self) -> Duration {
+        Duration::from_millis(self.state.runtime().config.server.request_timeout_ms)
+    }
+
+    /// Live inbound body cap (hot-reloadable).
+    fn max_body_bytes(&self) -> usize {
+        self.state.runtime().config.server.max_body_bytes
+    }
+
+    /// Live `moaray` debug-extension toggle (hot-reloadable).
+    fn moa_expose_metadata(&self) -> bool {
+        self.state.runtime().config.server.moa_expose_metadata
+    }
 }
 
 /// Build the axum router with all middleware applied.
+///
+/// Note: the inbound body cap is enforced per-request from the **live** config in
+/// [`pre_route`] (via `to_bytes` with a hard bound — no unbounded buffering), not
+/// by a startup-frozen `DefaultBodyLimit` tower layer. This is what makes
+/// `max_body_bytes` hot-reloadable (P3-3 F2): a startup-bound layer would cap a
+/// live increase and silently ignore the new value.
 pub fn build_router(ctx: ServerCtx) -> Router {
-    let body_limit = ctx.max_body_bytes;
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
-        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn(request_id_mw))
         .with_state(ctx)
 }
@@ -129,6 +153,13 @@ enum Routed {
         recipe: String,
         raw: Bytes,
         model: String,
+        /// The exact runtime snapshot this request was authorized + routed
+        /// against. Carried through so MoA execution uses the same orchestrator /
+        /// provider set even if a config hot-reload swaps the runtime in between —
+        /// the request can never run a recipe/provider set it was not routed for
+        /// (the passthrough path already carries its resolved provider for the same
+        /// reason).
+        runtime: std::sync::Arc<crate::runtime::Runtime>,
     },
 }
 
@@ -173,8 +204,8 @@ async fn chat_completions(
             recipe,
             raw,
             model,
+            runtime,
         } => {
-            let runtime = ctx.state.runtime.load_full();
             run_moa(
                 ctx,
                 runtime,
@@ -203,16 +234,19 @@ async fn pre_route(ctx: &ServerCtx, req: Request) -> Result<Routed, Error> {
 
     // Authenticate BEFORE touching the body so an invalid key fails closed with
     // 401 rather than doing body work / returning 413 for an oversized payload.
-    let rt = ctx.state.runtime();
+    // Pin ONE runtime snapshot (Arc) for the whole pre-route + (for MoA) execution
+    // so auth / allowlist / routing / orchestration all see the same config even if
+    // a hot-reload swaps the runtime mid-request.
+    let rt = ctx.state.runtime.load_full();
     let auth = authenticate(&rt.config.keys, &token)?;
 
     // Inbound per-key rate limit (429 rate_limited). Checked right after auth and
     // before any body work, so an over-rate caller fails fast and cheap.
     ctx.state.stateful.check_key_limit(&auth.key_id)?;
 
-    // Read the body (bounded by DefaultBodyLimit; over-limit yields 413).
+    // Read the body (bounded by the live max_body_bytes; over-limit yields 413).
     let body = req.into_body();
-    let raw = match axum::body::to_bytes(body, ctx.max_body_bytes).await {
+    let raw = match axum::body::to_bytes(body, ctx.max_body_bytes()).await {
         Ok(b) => b,
         Err(_) => return Err(Error::PayloadTooLarge),
     };
@@ -259,6 +293,7 @@ async fn pre_route(ctx: &ServerCtx, req: Request) -> Result<Routed, Error> {
                 recipe,
                 raw,
                 model,
+                runtime: rt.clone(),
             })
         }
         RouteTarget::Unknown { model } => Err(Error::ModelNotFound { model }),
@@ -278,9 +313,11 @@ async fn passthrough(
     started: Instant,
     provider: std::sync::Arc<dyn moaray_core::provider::Provider>,
 ) -> Result<Response, ApiError> {
+    // Read the per-request timeout from the live config snapshot (hot-reloadable).
+    let request_timeout = ctx.request_timeout();
     let rctx = ReqCtx {
         request_id,
-        deadline: Instant::now() + ctx.request_timeout,
+        deadline: Instant::now() + request_timeout,
         caller_key_id: auth.key_id.clone(),
         model: model.clone(),
     };
@@ -297,7 +334,7 @@ async fn passthrough(
             provider.passthrough(&rctx, raw_body).await
         }
     };
-    let result = match tokio::time::timeout(ctx.request_timeout, call).await {
+    let result = match tokio::time::timeout(request_timeout, call).await {
         Ok(r) => r,
         Err(_) => Err(Error::UpstreamTimeout),
     };
@@ -346,7 +383,7 @@ async fn run_moa(
 
     let rctx = ReqCtx {
         request_id,
-        deadline: Instant::now() + ctx.request_timeout,
+        deadline: Instant::now() + ctx.request_timeout(),
         caller_key_id,
         model: model.clone(),
     };
@@ -378,7 +415,7 @@ async fn run_moa(
             );
 
             let mut body = serde_json::to_value(&moa.response).unwrap_or_else(|_| json!({}));
-            if ctx.moa_expose_metadata {
+            if ctx.moa_expose_metadata() {
                 if let Some(obj) = body.as_object_mut() {
                     obj.insert("moaray".to_string(), moa_metadata(&moa));
                 }

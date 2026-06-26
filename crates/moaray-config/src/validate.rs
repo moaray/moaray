@@ -80,6 +80,13 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
             return Err(ConfigError::DuplicateModel(m.name));
         }
         let base_url = valid_base_url(&m.name, &m.base_url)?;
+        // Internal state key (limiter/breaker identity) is ALWAYS derived from the
+        // upstream identity triple — never user-set — so a model rename or an
+        // `upstream_id` relabel keeps the same bucket, and two aliases of one
+        // upstream share it (no per-upstream-cap bypass). The user-facing
+        // `upstream_id` is a low-cardinality observability label only (defaults to
+        // the model name); it must never key state and never carry base_url.
+        let state_key = ModelConfig::derive_state_key(m.provider_type, &base_url, &m.api_key_env);
         let upstream_id = m.upstream_id.clone().unwrap_or_else(|| m.name.clone());
         let rate_limit = valid_rate_limit("model", &m.name, m.rate_limit)?;
         models.insert(
@@ -89,6 +96,7 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
                 provider_type: m.provider_type,
                 base_url,
                 api_key_env: m.api_key_env,
+                state_key,
                 upstream_id,
                 rate_limit,
                 max_concurrency: m.max_concurrency,
@@ -97,19 +105,21 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
     }
     let known: BTreeSet<&String> = models.keys().collect();
 
-    // Per-upstream governance consistency: several models may share one
-    // `upstream_id` and then share a single token bucket / concurrency semaphore
-    // / breaker (`StatefulState` keys per upstream_id). If they declare
-    // *divergent* `rate_limit` / `max_concurrency`, `reconcile` keeps the first
-    // model by name and silently drops the rest — so renaming a model could
-    // weaken or disable a safety limit. Reject the ambiguity fail-fast at startup
-    // instead of resolving it order-dependently.
+    // Per-upstream governance consistency: several models may share one upstream
+    // identity (`state_key` = provider_type|base_url|api_key_env) and then share a
+    // single token bucket / concurrency semaphore / breaker (`StatefulState` keys
+    // per `state_key`). If they declare *divergent* `rate_limit` /
+    // `max_concurrency`, `reconcile` keeps the first model by name and silently
+    // drops the rest — so renaming a model could weaken or disable a safety limit.
+    // Reject the ambiguity fail-fast at startup instead of resolving it
+    // order-dependently. (Keyed by `state_key`, not the observability
+    // `upstream_id`: it is the identity triple that decides bucket sharing.)
     {
         let mut seen: BTreeMap<&str, &ModelConfig> = BTreeMap::new();
         for m in models.values() {
-            match seen.get(m.upstream_id.as_str()) {
+            match seen.get(m.state_key.as_str()) {
                 None => {
-                    seen.insert(m.upstream_id.as_str(), m);
+                    seen.insert(m.state_key.as_str(), m);
                 }
                 Some(first) => {
                     if first.rate_limit != m.rate_limit {
