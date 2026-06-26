@@ -281,26 +281,33 @@ impl ConfigReloader {
 /// F2: server fields that require a restart. Warn (do not error) if a reload
 /// tries to change them; the running value is kept.
 fn warn_on_frozen_field_changes(prev: &RuntimeConfig, new: &RuntimeConfig) {
-    if prev.server.bind != new.server.bind {
+    for field in frozen_field_changes(prev, new) {
         tracing::warn!(
-            old = %prev.server.bind, new = %new.server.bind,
-            "reload: `bind` change needs a restart — ignoring the new value"
+            field,
+            "reload: `{field}` change needs a restart — ignoring the new value"
         );
+    }
+}
+
+/// Pure detection of which restart-frozen server fields changed between two
+/// configs. Returned names drive the warn path; the running value is always kept.
+/// `usage_store` is frozen because the sink + its OS-thread writer are
+/// process-lifetime (per-model PRICES are NOT here — they hot-reload per request).
+fn frozen_field_changes(prev: &RuntimeConfig, new: &RuntimeConfig) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if prev.server.bind != new.server.bind {
+        changed.push("bind");
     }
     if prev.server.port != new.server.port {
-        tracing::warn!(
-            old = prev.server.port,
-            new = new.server.port,
-            "reload: `port` change needs a restart — ignoring the new value"
-        );
+        changed.push("port");
     }
     if prev.server.shutdown_grace_ms != new.server.shutdown_grace_ms {
-        tracing::warn!(
-            old = prev.server.shutdown_grace_ms,
-            new = new.server.shutdown_grace_ms,
-            "reload: `shutdown_grace_ms` change needs a restart — ignoring the new value"
-        );
+        changed.push("shutdown_grace_ms");
     }
+    if prev.server.usage_store != new.server.usage_store {
+        changed.push("usage_store");
+    }
+    changed
 }
 
 /// F6: warn (do not reject) when a model references an api_key_env that is not
@@ -406,5 +413,55 @@ models:
         // Same shape; api_key_env names are not set in the real OS env -> warn only.
         let out = reloader.apply_validated(&v1).await;
         assert!(out.is_ok(), "unset api_key_env must warn, not reject");
+    }
+
+    /// The `usage_store` knobs are restart-frozen: a reload that changes them must
+    /// be detected by the frozen-field check (warn path) — the running store is
+    /// kept because the sink is process-lifetime in AppState, untouched by reload.
+    #[test]
+    fn usage_store_change_is_detected_as_frozen() {
+        const WITHOUT: &str = r#"
+auth:
+  keys:
+    - id: team-a
+      key_env: INBOUND
+      allow_models: [a]
+models:
+  - {name: a, provider_type: openai-compat, base_url: https://a, api_key_env: KA}
+"#;
+        const WITH_STORE: &str = r#"
+server:
+  usage_store:
+    path: /tmp/moaray-usage.db
+auth:
+  keys:
+    - id: team-a
+      key_env: INBOUND
+      allow_models: [a]
+models:
+  - {name: a, provider_type: openai-compat, base_url: https://a, api_key_env: KA}
+"#;
+        let without = cfg(WITHOUT);
+        let with_store = cfg(WITH_STORE);
+
+        // Adding a store is a frozen change.
+        let changed = frozen_field_changes(&without, &with_store);
+        assert!(
+            changed.contains(&"usage_store"),
+            "adding usage_store must be flagged frozen, got {changed:?}"
+        );
+        // Changing the path is a frozen change.
+        let with_other = cfg(&WITH_STORE.replace("/tmp/moaray-usage.db", "/tmp/other.db"));
+        let changed2 = frozen_field_changes(&with_store, &with_other);
+        assert!(
+            changed2.contains(&"usage_store"),
+            "path change must be flagged"
+        );
+        // No change → not flagged (prices are NOT frozen and live elsewhere).
+        let changed3 = frozen_field_changes(&with_store, &cfg(WITH_STORE));
+        assert!(
+            !changed3.contains(&"usage_store"),
+            "identical store must not be flagged, got {changed3:?}"
+        );
     }
 }

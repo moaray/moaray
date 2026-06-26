@@ -141,9 +141,7 @@ impl UsageWriterHandle {
             let deadline = std::time::Instant::now() + timeout;
             while !join.is_finished() {
                 if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        "usage writer did not finish within flush timeout; detaching"
-                    );
+                    tracing::warn!("usage writer did not finish within flush timeout; detaching");
                     return; // detach: drop join handle without blocking
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -387,7 +385,10 @@ mod tests {
         // Some rows persisted; the exact count is timing-dependent (drops expected),
         // but it must be > 0 and <= the number sent.
         let n = row_count(&path);
-        assert!(n > 0 && n <= 10_000, "expected partial persistence, got {n}");
+        assert!(
+            n > 0 && n <= 10_000,
+            "expected partial persistence, got {n}"
+        );
     }
 
     #[test]

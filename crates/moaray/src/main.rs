@@ -32,7 +32,30 @@ async fn main() -> anyhow::Result<()> {
 
     let bind = config.server.bind.clone();
     let port = config.server.port;
-    let shutdown_grace = Duration::from_millis(config.server.shutdown_grace_ms);
+
+    // Build the usage-accounting sink + its writer handle BEFORE AppState. The
+    // sink goes into shared state (record-only, non-blocking); the writer handle
+    // stays local to main() for the post-serve shutdown flush. No `usage_store`
+    // configured => a NullSink (zero-overhead) + no handle.
+    let (usage_sink, usage_writer): (
+        Arc<dyn moaray_core::usage::UsageSink>,
+        Option<moaray_store::UsageWriterHandle>,
+    ) = match &config.server.usage_store {
+        Some(store) => {
+            let (sink, handle) = moaray_store::SqliteSink::new(
+                &store.path,
+                store.channel_capacity,
+                store.batch_size,
+            )
+            .with_context(|| format!("opening usage store at {}", store.path))?;
+            tracing::info!(path = %store.path, "usage accounting enabled");
+            (Arc::new(sink), Some(handle))
+        }
+        None => {
+            tracing::info!("usage accounting disabled (no server.usage_store configured)");
+            (Arc::new(moaray_store::NullSink), None)
+        }
+    };
 
     // Build the reload-surviving stateful layer FIRST so the provider registry
     // can be wrapped against the same per-upstream slots the handlers read.
@@ -51,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         providers,
         orchestrator,
     };
-    let state = AppState::with_stateful(runtime, stateful);
+    let state = AppState::with_sink(runtime, stateful, usage_sink);
     let metrics = observe::init_metrics();
 
     // The reloader owns the live state + persistent client + the last build (for
@@ -76,9 +99,23 @@ async fn main() -> anyhow::Result<()> {
     spawn_reload_on_sighup(reloader);
 
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown_grace))
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+
+    // axum's graceful shutdown has finished draining in-flight requests by the
+    // time `.await` returns — so flush the enqueued usage rows NOW, bounded by a
+    // timeout (detach-on-timeout so a stuck writer can't hang process exit). The
+    // old post-serve `sleep(grace)` was dead code (the drain already happened),
+    // so it is intentionally gone — only the bounded flush remains.
+    if let Some(handle) = usage_writer {
+        let flush_timeout = Duration::from_secs(5);
+        tracing::info!(
+            timeout_ms = flush_timeout.as_millis() as u64,
+            "flushing usage store on shutdown"
+        );
+        handle.flush_and_join(flush_timeout);
+    }
     Ok(())
 }
 
@@ -123,8 +160,10 @@ fn init_tracing() {
         .init();
 }
 
-/// Wait for SIGTERM/SIGINT, then allow a bounded drain window.
-async fn shutdown_signal(grace: Duration) {
+/// Wait for SIGTERM/SIGINT, then resolve immediately. Draining of in-flight
+/// requests is handled by axum's `with_graceful_shutdown`; the usage-store flush
+/// happens in `main()` AFTER `serve(...).await` returns (i.e. after the drain).
+async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -145,11 +184,5 @@ async fn shutdown_signal(grace: Duration) {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tracing::info!(
-        grace_ms = grace.as_millis() as u64,
-        "shutdown signal received, draining"
-    );
-    // axum's graceful shutdown stops accepting new conns and waits for in-flight
-    // ones; we cap the wait so a stuck upstream can't block shutdown forever.
-    tokio::time::sleep(grace).await;
+    tracing::info!("shutdown signal received, draining in-flight requests");
 }

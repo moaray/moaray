@@ -20,6 +20,7 @@ moaray-core = { path = "../moaray-core" }
 moaray-config = { path = "../moaray-config" }
 moaray-providers = { path = "../moaray-providers" }
 moaray-moa = { path = "../moaray-moa" }
+moaray-store = { path = "../moaray-store" }
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -48,3 +49,4 @@ tracing-subscriber.workspace = true
 tower.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+tempfile = "3"

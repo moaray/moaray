@@ -46,6 +46,35 @@ pub struct ServerDoc {
     /// Upstream retry defaults. Retries are **off** unless explicitly enabled.
     #[serde(default)]
     pub retry: RetryDoc,
+    /// Optional persistent usage/cost accounting store. **Absent ⇒ accounting
+    /// disabled** (a `NullSink`). These knobs are restart-frozen (the sink is
+    /// process-lifetime): a hot reload warns and ignores changes to them.
+    #[serde(default)]
+    pub usage_store: Option<UsageStoreDoc>,
+}
+
+/// Persistent usage-accounting store config (v0.2-P1). Restart-frozen: changing
+/// any field requires a restart (a reload warns + keeps the running value).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageStoreDoc {
+    /// Filesystem path to the SQLite database file (created if absent).
+    pub path: String,
+    /// Bounded channel capacity between the hot path and the writer thread.
+    /// On a full channel a row is dropped (best-effort posture).
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Max rows per write transaction on the writer thread.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_channel_capacity() -> usize {
+    8192
+}
+
+fn default_batch_size() -> usize {
+    256
 }
 
 /// Per-upstream circuit-breaker tuning. State is kept per `upstream_id` and
@@ -144,6 +173,7 @@ impl Default for ServerDoc {
             moa_expose_metadata: false,
             breaker: BreakerDoc::default(),
             retry: RetryDoc::default(),
+            usage_store: None,
         }
     }
 }
@@ -228,6 +258,16 @@ pub struct ModelDoc {
     /// across passthrough + MoA via `upstream_id`. `None` means unbounded.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// Optional prompt-token price in USD per 1M tokens (e.g. `0.15`). When both
+    /// price fields are set, usage rows for this model are priced; when absent the
+    /// row stores tokens with a NULL cost and `status=unpriced`. Hot-reloadable
+    /// (read from the pinned runtime snapshot per request).
+    #[serde(default)]
+    pub price_prompt_per_mtok_usd: Option<f64>,
+    /// Optional completion-token price in USD per 1M tokens (e.g. `0.60`). See
+    /// `price_prompt_per_mtok_usd`.
+    #[serde(default)]
+    pub price_completion_per_mtok_usd: Option<f64>,
 }
 
 /// Supported provider adapter kinds.

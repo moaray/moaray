@@ -21,7 +21,9 @@ use moaray_core::types::{ChatRequest, ChatResponse};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::anthropic_map::{anthropic_to_openai, openai_to_anthropic, usage_tokens, ANTHROPIC_VERSION};
+use crate::anthropic_map::{
+    anthropic_to_openai, openai_to_anthropic, usage_tokens, ANTHROPIC_VERSION,
+};
 use crate::anthropic_sse::translate;
 use crate::common::{map_reqwest_error, map_upstream_status, REQUEST_ID_HEADER};
 

@@ -666,10 +666,7 @@ mod tests {
         assert_eq!(usage["total_tokens"], serde_json::json!(130));
         // 4 arm outcomes, one of them error
         assert_eq!(arms.len(), 4);
-        assert_eq!(
-            arms.iter().filter(|a| a.status == ArmStatus::Ok).count(),
-            3
-        );
+        assert_eq!(arms.iter().filter(|a| a.status == ArmStatus::Ok).count(), 3);
         assert_eq!(
             arms.iter().filter(|a| a.status == ArmStatus::Error).count(),
             1

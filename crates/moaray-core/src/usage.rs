@@ -150,10 +150,7 @@ pub fn compute_cost(
 ) -> Option<i64> {
     // Cost is defined only when we have measured tokens AND a price snapshot.
     let (pt, ct) = (prompt_tokens?, completion_tokens?);
-    let (pp, cp) = (
-        price_prompt_nano_per_mtok?,
-        price_completion_nano_per_mtok?,
-    );
+    let (pp, cp) = (price_prompt_nano_per_mtok?, price_completion_nano_per_mtok?);
     // i128 intermediates so a large token count * nano price cannot overflow i64
     // before the divide. round-half-up via (x + 5e5) / 1e6 on non-negative inputs.
     let mtok: i128 = 1_000_000;
@@ -217,7 +214,12 @@ mod tests {
     #[test]
     fn no_overflow_on_large_counts() {
         // 1e12 tokens @ 1e9 nano/Mtok would overflow i64 if multiplied directly.
-        let cost = compute_cost(Some(1_000_000_000_000), Some(0), Some(1_000_000_000), Some(1));
+        let cost = compute_cost(
+            Some(1_000_000_000_000),
+            Some(0),
+            Some(1_000_000_000),
+            Some(1),
+        );
         // 1e12 * 1e9 / 1e6 = 1e15 nano-USD, fits in i64.
         assert_eq!(cost, Some(1_000_000_000_000_000));
     }

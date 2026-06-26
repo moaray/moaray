@@ -46,6 +46,13 @@ pub enum ConfigError {
     #[error("{scope} `{name}` rate_limit.rps must be >= 1")]
     BadRateLimit { scope: &'static str, name: String },
 
+    #[error("model `{model}` {field} must be a finite, non-negative price (got {value})")]
+    BadPrice {
+        model: String,
+        field: &'static str,
+        value: String,
+    },
+
     #[error(
         "models `{first}` and `{second}` resolve to the same upstream identity \
          (provider_type|base_url|api_key_env, observability upstream_id `{upstream_id}`) but \
