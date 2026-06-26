@@ -46,6 +46,7 @@ cargo build --release -p moaray -p mock-upstream >/dev/null
 
 cleanup() {
   [[ -n "${MOARAY_PID:-}" ]] && kill "$MOARAY_PID" 2>/dev/null || true
+  [[ -n "${MOARAY_STORE_PID:-}" ]] && kill "$MOARAY_STORE_PID" 2>/dev/null || true
   [[ -n "${MOCK_PID:-}" ]] && kill "$MOCK_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -81,10 +82,28 @@ MOARAY_CONFIG="$CFG" \
   "$ROOT/target/release/moaray" &
 MOARAY_PID=$!
 
+# --- second moaray instance WITH usage_store enabled (G8 configured variant) --
+# Same config + a usage_store block, on a separate port, so we can measure the
+# added p95 of accounting (Arc-clone + try_send) vs the store-off leg above.
+STORE_PORT="${STORE_PORT:-$((MOARAY_PORT + 1))}"
+STORE_DB="$(mktemp -u).db"
+CFG_STORE="$(mktemp)"
+# Rewrite the port AND inject a usage_store block under `server:` (right after the
+# port line, so it lands at the correct 2-space indent inside server).
+sed -e "s|  port: $MOARAY_PORT|  port: $STORE_PORT\n  usage_store:\n    path: $STORE_DB\n    channel_capacity: 8192\n    batch_size: 256|" \
+  "$CFG" > "$CFG_STORE"
+echo "==> starting moaray+store on :$STORE_PORT (db=$STORE_DB)"
+MOARAY_CONFIG="$CFG_STORE" \
+  MOARAY_SMOKE_INBOUND="$INBOUND_KEY" \
+  MOARAY_SMOKE_UPSTREAM="sk-upstream" \
+  "$ROOT/target/release/moaray" &
+MOARAY_STORE_PID=$!
+
 # wait for both to listen
 for _ in $(seq 1 50); do
   if curl -fsS "http://127.0.0.1:$MOCK_PORT/healthz" >/dev/null 2>&1 \
-     && curl -fsS "http://127.0.0.1:$MOARAY_PORT/healthz" >/dev/null 2>&1; then
+     && curl -fsS "http://127.0.0.1:$MOARAY_PORT/healthz" >/dev/null 2>&1 \
+     && curl -fsS "http://127.0.0.1:$STORE_PORT/healthz" >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
@@ -109,14 +128,25 @@ MOARAY_JSON="$(run_leg moaray \
   -m POST -H 'content-type: application/json' \
   -H "authorization: Bearer $INBOUND_KEY" -D "$PAYLOAD")"
 
+# Gateway+store leg: through moaray with usage_store enabled (G8 variant).
+STORE_JSON="$(run_leg moaray+store \
+  "http://127.0.0.1:$STORE_PORT/v1/chat/completions" \
+  -m POST -H 'content-type: application/json' \
+  -H "authorization: Bearer $INBOUND_KEY" -D "$PAYLOAD")"
+
 # --- extract p50/p95 (oha JSON: .latencyPercentiles.p50 in seconds) ----------
 pctl() { python3 -c "import json,sys;d=json.load(sys.stdin);print(round(d['latencyPercentiles']['$1']*1000,3))"; }
 D_P50="$(printf '%s' "$DIRECT_JSON" | pctl p50)"
 D_P95="$(printf '%s' "$DIRECT_JSON" | pctl p95)"
 M_P50="$(printf '%s' "$MOARAY_JSON" | pctl p50)"
 M_P95="$(printf '%s' "$MOARAY_JSON" | pctl p95)"
+S_P50="$(printf '%s' "$STORE_JSON" | pctl p50)"
+S_P95="$(printf '%s' "$STORE_JSON" | pctl p95)"
 ADD_P50="$(python3 -c "print(round($M_P50-$D_P50,3))")"
 ADD_P95="$(python3 -c "print(round($M_P95-$D_P95,3))")"
+# Added cost of accounting itself: store leg vs store-off gateway leg.
+ACC_P50="$(python3 -c "print(round($S_P50-$M_P50,3))")"
+ACC_P95="$(python3 -c "print(round($S_P95-$M_P95,3))")"
 
 cat <<REPORT
 
@@ -124,10 +154,12 @@ cat <<REPORT
 tool=$TOOL concurrency=$CONCURRENCY duration=$DURATION warmup=$WARMUP
 mock_delay_ms=$MOCK_DELAY_MS payload=$(basename "$PAYLOAD")
 ---------------------------------------------------
-leg       p50(ms)   p95(ms)
-direct    $D_P50    $D_P95
-moaray    $M_P50    $M_P95
+leg           p50(ms)   p95(ms)
+direct        $D_P50    $D_P95
+moaray        $M_P50    $M_P95
+moaray+store  $S_P50    $S_P95
 ---------------------------------------------------
-ADDED OVERHEAD  p50=${ADD_P50}ms  p95=${ADD_P95}ms
+ADDED OVERHEAD (gateway vs direct)  p50=${ADD_P50}ms  p95=${ADD_P95}ms
+ACCOUNTING COST (store vs gateway)  p50=${ACC_P50}ms  p95=${ACC_P95}ms
 ===================================================
 REPORT

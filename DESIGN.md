@@ -73,10 +73,13 @@ replace your gateway and unlock a quality-boosting MoA mode on top."
 
 - `moaray` (bin) — server entrypoint, wiring, config load.
 - `moaray-core` — types (chat req/resp, streaming chunk), Provider trait,
-  router, error model.
+  router, error model, the usage-accounting trait/DTO (`UsageSink`,
+  `UsageRecord`) + the pure `compute_cost` helper.
 - `moaray-providers` — openai-compat + anthropic adapters.
 - `moaray-moa` — orchestrator: recipe, fan-out, aggregation strategies, judge.
 - `moaray-config` — config schema + load/validate + hot-reload.
+- `moaray-store` — concrete usage sinks: `SqliteSink` (rusqlite bundled, dedicated
+  OS-thread writer), `NullSink` (default), `VecSink` (test util).
 
 (Single binary; split crates for testability and clean boundaries.)
 
@@ -112,8 +115,33 @@ debugging (toggle via config; off by default in prod).
 
 ## 5. Out of scope for v1 (explicit)
 
-- Billing/cost accounting, multi-tenant dashboards, persistent request store,
-  embeddings/image/audio endpoints, web UI. (Revisit in v2.)
+- Multi-tenant dashboards, embeddings/image/audio endpoints, web UI. (Revisit in v2.)
+
+> **Persistent request store + cost accounting landed in v0.2-P1** (no longer
+> out of scope). One row per upstream call (each MoA proposer, the aggregator,
+> each non-stream passthrough) is written to SQLite behind a `UsageSink` trait,
+> with raw token counts + a price snapshot + a computed `cost_nano_usd`. Wiring
+> is opt-in via `server.usage_store` (absent ⇒ `NullSink`, zero overhead).
+>
+> **Posture: best-effort, telemetry-grade — NOT an invoice-grade ledger.** The
+> hot path only `try_send`s onto a bounded channel drained by a dedicated
+> OS-thread writer; under sustained overload rows are dropped
+> (`moaray_usage_dropped_total`) rather than ever blocking or slowing a user
+> request. Raw tokens + the price snapshot are stored on every row so cost is
+> recomputable exactly at query time.
+>
+> **Known limitations (v0.2-P1):**
+> - **Streaming passthrough** is not accounted (usage arrives only in the final
+>   SSE frame; tapping it would buffer the stream and break `streaming-passthrough`).
+>   The gap is observable via `moaray_usage_unaccounted_stream_total`. Deferred to P2.
+> - **Failed non-stream passthrough** books no row (no tokens to count) —
+>   intentionally asymmetric with MoA's explicit failed-arm rows.
+> - **Anthropic "usage absent"** is judged on the raw upstream `usage` key before
+>   translation (`anthropic_to_openai` always emits `usage`, zeros when absent) →
+>   `ok_no_usage` when truly absent, without ever rewriting genuinely-zero `0,0`
+>   openai rows.
+> - `/v1/usage` read endpoint, dashboards, multi-tenant quotas, back-fill, and
+>   upstream-invoice reconciliation → P2+.
 
 ## 6. Acceptance (definition of done)
 

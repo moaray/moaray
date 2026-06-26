@@ -49,4 +49,6 @@ tracing-subscriber.workspace = true
 tower.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+moaray-store = { path = "../moaray-store" }
+rusqlite.workspace = true
 tempfile = "3"

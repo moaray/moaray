@@ -963,6 +963,7 @@ dependencies = [
  "moaray-providers",
  "moaray-store",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
