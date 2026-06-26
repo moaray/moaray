@@ -51,6 +51,13 @@ pub fn map_reqwest_error(e: &reqwest::Error) -> Error {
 }
 
 /// Collect a non-streaming body into a single-chunk [`RawResponse`].
+///
+/// Taps the upstream `usage` object **here, while the bytes are still held** (the
+/// caller has already moved them into the relay stream by the time it returns, so
+/// parsing in the caller would force a second drain — forbidden by the
+/// `streaming-passthrough`/no-double-drain contract). The parse is best-effort
+/// and read-only: the body is relayed byte-for-byte verbatim regardless, and a
+/// non-JSON or usage-less body simply yields `usage: None`.
 pub async fn collect_response(resp: reqwest::Response) -> Result<RawResponse, Error> {
     let status = resp.status().as_u16();
     let content_type = resp
@@ -59,12 +66,35 @@ pub async fn collect_response(resp: reqwest::Response) -> Result<RawResponse, Er
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
     let bytes = resp.bytes().await.map_err(|e| map_reqwest_error(&e))?;
+    // Non-stream usage tap: peek the JSON `usage` object before the bytes move
+    // into the relay stream. Read-only; never mutates the relayed body.
+    let usage = parse_usage_tokens(&bytes);
     let body: ByteStream = Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
     Ok(RawResponse {
         status,
         content_type,
         body,
+        usage,
     })
+}
+
+/// Best-effort, read-only extraction of `(prompt_tokens, completion_tokens)` from
+/// an OpenAI-shaped response body's `usage` object. Returns `None` when the body
+/// is not JSON, has no `usage` object, or lacks both token fields. A
+/// genuinely-zero usage (`{"prompt_tokens":0,"completion_tokens":0}`) returns
+/// `Some((0,0))` — it is the caller's job (not this helper's) to map zeros.
+pub fn parse_usage_tokens(bytes: &Bytes) -> Option<(i64, i64)> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let usage = v.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    let p = usage.get("prompt_tokens").and_then(|x| x.as_i64());
+    let c = usage.get("completion_tokens").and_then(|x| x.as_i64());
+    match (p, c) {
+        (None, None) => None,
+        (p, c) => Some((p.unwrap_or(0), c.unwrap_or(0))),
+    }
 }
 
 /// Build a streaming [`RawResponse`] from an upstream response, relaying frames.
@@ -80,6 +110,9 @@ pub fn stream_response(resp: reqwest::Response) -> RawResponse {
         status,
         content_type,
         body: relay_stream_inner(resp),
+        // Streaming path never taps usage (would require buffering the SSE
+        // stream); the gap is made observable by a counter at the app layer.
+        usage: None,
     }
 }
 

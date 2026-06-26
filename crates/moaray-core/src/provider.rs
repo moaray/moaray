@@ -49,6 +49,13 @@ pub struct RawResponse {
     pub content_type: Option<String>,
     /// Response body as a byte stream (single chunk for non-stream).
     pub body: ByteStream,
+    /// Parsed `(prompt_tokens, completion_tokens)` from the upstream `usage`
+    /// object, populated by providers on the **non-stream** path only (tapped
+    /// inside `collect_response`/the anthropic translation while the bytes are
+    /// still held — never a second drain, so `streaming-passthrough` is honored).
+    /// `None` on the streaming path and whenever usage was absent. The body is
+    /// still relayed verbatim regardless of this field.
+    pub usage: Option<(i64, i64)>,
 }
 
 impl std::fmt::Debug for RawResponse {
@@ -57,6 +64,7 @@ impl std::fmt::Debug for RawResponse {
             .field("status", &self.status)
             .field("content_type", &self.content_type)
             .field("body", &"<stream>")
+            .field("usage", &self.usage)
             .finish()
     }
 }

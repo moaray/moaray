@@ -7,8 +7,10 @@ pub mod error;
 pub mod provider;
 pub mod router;
 pub mod types;
+pub mod usage;
 
 pub use error::{Error, ErrorEnvelope, Result};
 pub use provider::{ByteStream, Provider, RawResponse, ReqCtx};
 pub use router::{route, RouteTarget, MOA_AUTO, MOA_PREFIX};
 pub use types::{ChatChunk, ChatMessage, ChatRequest, ChatResponse};
+pub use usage::{compute_cost, UsageArm, UsagePath, UsageRecord, UsageSink, UsageStatus};

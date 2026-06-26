@@ -160,7 +160,7 @@ pub fn anthropic_to_openai(resp: &Value, model: &str) -> Result<Value> {
     }))
 }
 
-fn usage_tokens(usage: Option<&Value>) -> (u64, u64) {
+pub(crate) fn usage_tokens(usage: Option<&Value>) -> (u64, u64) {
     let u = match usage {
         Some(v) => v,
         None => return (0, 0),

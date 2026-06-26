@@ -21,7 +21,7 @@ use moaray_core::types::{ChatRequest, ChatResponse};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::anthropic_map::{anthropic_to_openai, openai_to_anthropic, ANTHROPIC_VERSION};
+use crate::anthropic_map::{anthropic_to_openai, openai_to_anthropic, usage_tokens, ANTHROPIC_VERSION};
 use crate::anthropic_sse::translate;
 use crate::common::{map_reqwest_error, map_upstream_status, REQUEST_ID_HEADER};
 
@@ -98,6 +98,17 @@ impl Provider for AnthropicProvider {
         map_upstream_status(status)?;
         let bytes = resp.bytes().await.map_err(|e| map_reqwest_error(&e))?;
         let anthropic: Value = serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamError)?;
+        // Usage tap (raw-key absence mitigation, DP2): `anthropic_to_openai`
+        // ALWAYS emits a `usage` object, defaulting a missing upstream usage to
+        // `0,0` — so the translated body cannot tell "absent" from "genuinely
+        // zero". Judge absence on the RAW upstream key here: `usage` present =>
+        // take its translated `(input,output)` tokens; absent => `None` (the app
+        // maps that to `ok_no_usage`). We never inspect/rewrite the `0,0` values
+        // themselves, so genuinely-zero rows are preserved.
+        let usage = anthropic.get("usage").map(|u| {
+            let (p, c) = usage_tokens(Some(u));
+            (p as i64, c as i64)
+        });
         let openai = anthropic_to_openai(&anthropic, &model)?;
         let out = serde_json::to_vec(&openai).map_err(|_| Error::Internal)?;
         let body: ByteStream = Box::pin(futures_util::stream::once(
@@ -107,6 +118,7 @@ impl Provider for AnthropicProvider {
             status,
             content_type: Some("application/json".to_string()),
             body,
+            usage,
         })
     }
 
@@ -129,6 +141,8 @@ impl Provider for AnthropicProvider {
             status,
             content_type: Some("text/event-stream".to_string()),
             body: Box::pin(translated),
+            // Streaming path never taps usage (would buffer the SSE stream).
+            usage: None,
         })
     }
 
