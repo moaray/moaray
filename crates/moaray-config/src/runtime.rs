@@ -42,6 +42,19 @@ pub struct ServerConfig {
     pub breaker: BreakerConfig,
     /// Upstream retry policy (off unless explicitly enabled).
     pub retry: RetryConfig,
+    /// Optional persistent usage store (None ⇒ accounting disabled).
+    pub usage_store: Option<UsageStoreConfig>,
+}
+
+/// Validated persistent usage-store config. Restart-frozen (process-lifetime sink).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageStoreConfig {
+    /// SQLite database file path.
+    pub path: String,
+    /// Bounded channel capacity (hot path → writer thread).
+    pub channel_capacity: usize,
+    /// Max rows per write transaction.
+    pub batch_size: usize,
 }
 
 /// Validated per-upstream circuit-breaker thresholds.
@@ -138,6 +151,11 @@ pub struct ModelConfig {
     pub rate_limit: Option<RateLimit>,
     /// Optional per-upstream concurrency cap. `None` means unbounded.
     pub max_concurrency: Option<u32>,
+    /// Prompt-token price as integer nano-USD per 1M tokens (converted from the
+    /// `price_prompt_per_mtok_usd` USD float at validation). `None` = unpriced.
+    pub price_prompt_nano_per_mtok: Option<i64>,
+    /// Completion-token price as integer nano-USD per 1M tokens. `None` = unpriced.
+    pub price_completion_nano_per_mtok: Option<i64>,
 }
 
 impl ModelConfig {
@@ -167,6 +185,14 @@ impl fmt::Debug for ModelConfig {
             .field("upstream_id", &self.upstream_id)
             .field("rate_limit", &self.rate_limit)
             .field("max_concurrency", &self.max_concurrency)
+            .field(
+                "price_prompt_nano_per_mtok",
+                &self.price_prompt_nano_per_mtok,
+            )
+            .field(
+                "price_completion_nano_per_mtok",
+                &self.price_completion_nano_per_mtok,
+            )
             .finish()
     }
 }

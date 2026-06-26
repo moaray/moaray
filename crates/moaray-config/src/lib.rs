@@ -11,7 +11,7 @@ pub mod validate;
 pub use error::ConfigError;
 pub use runtime::{
     BreakerConfig, KeyConfig, KeySecret, ModelConfig, RateLimit, RecipeConfig, RetryConfig,
-    RuntimeConfig, ServerConfig,
+    RuntimeConfig, ServerConfig, UsageStoreConfig,
 };
 pub use schema::{ConfigDoc, ProviderType, Strategy};
 pub use validate::{validate, EnvSource, OsEnv};
@@ -105,6 +105,91 @@ recipes:
 
     fn reject(yaml: &str) -> ConfigError {
         load_yaml_with_env(yaml, &env()).expect_err("should reject")
+    }
+
+    #[test]
+    fn prices_round_trip_usd_to_nano_per_mtok() {
+        let y = r#"
+auth:
+  keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt]}]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_KEY
+    price_prompt_per_mtok_usd: 0.15
+    price_completion_per_mtok_usd: 0.60
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("valid");
+        let m = &cfg.models["gpt"];
+        // 0.15 USD/Mtok → 150_000_000 nano-USD/Mtok; 0.60 → 600_000_000.
+        assert_eq!(m.price_prompt_nano_per_mtok, Some(150_000_000));
+        assert_eq!(m.price_completion_nano_per_mtok, Some(600_000_000));
+    }
+
+    #[test]
+    fn absent_prices_are_none() {
+        let cfg = load_yaml_with_env(VALID, &env()).expect("valid");
+        assert_eq!(cfg.models["gpt"].price_prompt_nano_per_mtok, None);
+        assert_eq!(cfg.models["gpt"].price_completion_nano_per_mtok, None);
+    }
+
+    #[test]
+    fn rejects_negative_price() {
+        let y = r#"
+auth:
+  keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt]}]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_KEY
+    price_prompt_per_mtok_usd: -0.1
+"#;
+        assert!(matches!(reject(y), ConfigError::BadPrice { .. }));
+    }
+
+    #[test]
+    fn rejects_absurd_price_that_would_overflow_nano_i64() {
+        // ~1e19 USD/Mtok * 1e9 > i64::MAX nano — must reject, not silently saturate.
+        let y = r#"
+auth:
+  keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt]}]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_KEY
+    price_prompt_per_mtok_usd: 1e19
+"#;
+        assert!(matches!(reject(y), ConfigError::BadPrice { .. }));
+    }
+
+    #[test]
+    fn parses_usage_store_with_defaults() {
+        let y = r#"
+server:
+  usage_store:
+    path: /var/lib/moaray/usage.db
+auth:
+  keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt]}]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_KEY
+"#;
+        let cfg = load_yaml_with_env(y, &env()).expect("valid");
+        let us = cfg.server.usage_store.expect("usage_store present");
+        assert_eq!(us.path, "/var/lib/moaray/usage.db");
+        assert_eq!(us.channel_capacity, 8192);
+        assert_eq!(us.batch_size, 256);
+    }
+
+    #[test]
+    fn usage_store_absent_disables_accounting() {
+        let cfg = load_yaml_with_env(VALID, &env()).expect("valid");
+        assert!(cfg.server.usage_store.is_none());
     }
 
     #[test]

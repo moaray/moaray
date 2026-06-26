@@ -13,7 +13,7 @@ use url::Url;
 use crate::error::ConfigError;
 use crate::runtime::{
     BreakerConfig, KeyConfig, KeySecret, ModelConfig, RateLimit, RecipeConfig, RetryConfig,
-    RuntimeConfig, ServerConfig,
+    RuntimeConfig, ServerConfig, UsageStoreConfig,
 };
 use crate::schema::{ConfigDoc, RateLimitDoc};
 
@@ -67,6 +67,41 @@ fn valid_rate_limit(
     }
 }
 
+/// Convert an optional USD-per-1M-tokens price float into integer nano-USD per
+/// 1M tokens (`round(usd * 1e9)`). Rejects NaN/inf and negative prices. `None`
+/// passes through as `None` (unpriced).
+fn valid_price(
+    model: &str,
+    field: &'static str,
+    value: Option<f64>,
+) -> Result<Option<i64>, ConfigError> {
+    match value {
+        None => Ok(None),
+        Some(v) => {
+            if !v.is_finite() || v < 0.0 {
+                return Err(ConfigError::BadPrice {
+                    model: model.to_string(),
+                    field,
+                    value: v.to_string(),
+                });
+            }
+            // Reject a finite-but-absurd price that would overflow i64 when scaled
+            // to nano-USD/Mtok: the float→i64 cast saturates silently, which would
+            // accept a different price than configured. This is the only price
+            // normalization point, so reject here rather than store a wrong snapshot.
+            let nano = (v * 1_000_000_000.0).round();
+            if nano > i64::MAX as f64 {
+                return Err(ConfigError::BadPrice {
+                    model: model.to_string(),
+                    field,
+                    value: v.to_string(),
+                });
+            }
+            Ok(Some(nano as i64))
+        }
+    }
+}
+
 /// Validate a parsed [`ConfigDoc`], producing a [`RuntimeConfig`].
 pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, ConfigError> {
     if doc.models.is_empty() {
@@ -89,6 +124,16 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
         let state_key = ModelConfig::derive_state_key(m.provider_type, &base_url, &m.api_key_env);
         let upstream_id = m.upstream_id.clone().unwrap_or_else(|| m.name.clone());
         let rate_limit = valid_rate_limit("model", &m.name, m.rate_limit)?;
+        let price_prompt_nano_per_mtok = valid_price(
+            &m.name,
+            "price_prompt_per_mtok_usd",
+            m.price_prompt_per_mtok_usd,
+        )?;
+        let price_completion_nano_per_mtok = valid_price(
+            &m.name,
+            "price_completion_per_mtok_usd",
+            m.price_completion_per_mtok_usd,
+        )?;
         models.insert(
             m.name.clone(),
             ModelConfig {
@@ -100,6 +145,8 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
                 upstream_id,
                 rate_limit,
                 max_concurrency: m.max_concurrency,
+                price_prompt_nano_per_mtok,
+                price_completion_nano_per_mtok,
             },
         );
     }
@@ -233,6 +280,11 @@ pub fn validate<E: EnvSource>(doc: ConfigDoc, env: &E) -> Result<RuntimeConfig, 
             max_retries: doc.server.retry.max_retries,
             backoff_ms: doc.server.retry.backoff_ms,
         },
+        usage_store: doc.server.usage_store.map(|u| UsageStoreConfig {
+            path: u.path,
+            channel_capacity: u.channel_capacity,
+            batch_size: u.batch_size,
+        }),
     };
 
     Ok(RuntimeConfig {

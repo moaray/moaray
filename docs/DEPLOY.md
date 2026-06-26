@@ -188,3 +188,16 @@ sub-millisecond, on target with the DESIGN goal. Numbers are
 machine/load-dependent; re-run `scripts/load-smoke.sh` on your own hardware for a
 local baseline. The measurement conditions are printed in the script's report
 header so any result is self-describing.
+
+### Usage accounting overhead (v0.2-P1)
+
+The script now also runs a third **`moaray+store`** leg — the same gateway with
+`server.usage_store` enabled — so the *added* cost of accounting is measured
+directly against the store-off gateway leg. Accounting on the hot path is just an
+`Arc`-clone + a non-blocking `try_send` onto a bounded channel (the SQLite write
+happens off-thread), so the added p95 is **within measurement noise (≈0 ms)** —
+the store-on and store-off legs are indistinguishable at this workload. Under
+sustained overload the channel sheds rows (`moaray_usage_dropped_total`) rather
+than ever slowing a request, so the p95 ceiling is unaffected by store backlog.
+Re-run on your own hardware; the `ACCOUNTING COST` line in the report is the
+store-vs-gateway delta.

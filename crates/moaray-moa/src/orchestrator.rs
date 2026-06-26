@@ -66,6 +66,12 @@ pub struct ArmOutcome {
     pub status: ArmStatus,
     /// Whether the arm reported a `usage` object (false => omitted upstream).
     pub usage_present: bool,
+    /// Raw prompt tokens from the arm's `usage` object, if present. `None` =
+    /// unmeasured (usage absent / arm failed / timed out). Source of truth for
+    /// cost accounting; the app builds the `UsageRecord` from these.
+    pub prompt_tokens: Option<i64>,
+    /// Raw completion tokens from the arm's `usage` object, if present.
+    pub completion_tokens: Option<i64>,
 }
 
 /// What a successful MoA run produces.
@@ -77,6 +83,26 @@ pub struct MoaResult {
     pub arms: Vec<ArmOutcome>,
     /// The aggregator/judge arm outcome.
     pub aggregator: ArmOutcome,
+}
+
+/// The full result of a MoA run — **always** carries every arm outcome so the app
+/// can book a usage row per arm even when the run fails (plan §8③, codex C2).
+///
+/// `run()` returns this instead of `Result<MoaResult>` so a quorum failure or an
+/// aggregator-resolve/-call failure still surfaces the proposer (and any
+/// aggregator) outcomes that already incurred upstream cost, rather than dropping
+/// them with a `?`. The app books rows from `proposers` + `aggregator`
+/// unconditionally, then maps `outcome` to the HTTP response.
+#[derive(Debug)]
+pub struct MoaRun {
+    /// Every proposer arm outcome, in recipe order. Always present (the fan-out
+    /// ran) — empty only if there were no proposers.
+    pub proposers: Vec<ArmOutcome>,
+    /// The aggregator arm outcome, or `None` if aggregation never ran (quorum
+    /// failed, or the aggregator provider could not be resolved).
+    pub aggregator: Option<ArmOutcome>,
+    /// `Ok` = the fused completion to render; `Err` = the gateway error to map.
+    pub outcome: Result<moaray_core::types::ChatResponse>,
 }
 
 /// Internal: a finished arm — its outcome plus the response when successful.
@@ -138,6 +164,21 @@ fn sum_usage<'a>(usages: impl Iterator<Item = &'a Value>) -> Value {
     Value::Object(acc)
 }
 
+/// Extract raw `(prompt_tokens, completion_tokens)` from a `usage` object.
+///
+/// `ChatResponse.usage` is an untyped `Option<Value>` (not a typed struct), so we
+/// read the integer fields defensively: a missing field contributes `None`, and a
+/// non-integer value is ignored. Returns `(None, None)` when there is no usage
+/// object at all.
+fn extract_tokens(usage: Option<&Value>) -> (Option<i64>, Option<i64>) {
+    let Some(u) = usage else {
+        return (None, None);
+    };
+    let pt = u.get("prompt_tokens").and_then(|v| v.as_i64());
+    let ct = u.get("completion_tokens").and_then(|v| v.as_i64());
+    (pt, ct)
+}
+
 /// Run one arm to completion (or timeout), capturing a non-leaking outcome.
 async fn run_arm(
     provider: Option<Arc<dyn Provider>>,
@@ -165,6 +206,8 @@ async fn run_arm(
                 latency_ms: start.elapsed().as_millis() as u64,
                 status: ArmStatus::Error,
                 usage_present: false,
+                prompt_tokens: None,
+                completion_tokens: None,
             },
             response: None,
         };
@@ -183,12 +226,15 @@ async fn run_arm(
                     latency_ms,
                     status: ArmStatus::Timeout,
                     usage_present: false,
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 },
                 response: None,
             }
         }
         Ok(Ok(resp)) => {
             let usage_present = resp.usage.is_some();
+            let (prompt_tokens, completion_tokens) = extract_tokens(resp.usage.as_ref());
             ArmRun {
                 idx,
                 outcome: ArmOutcome {
@@ -197,6 +243,8 @@ async fn run_arm(
                     latency_ms,
                     status: ArmStatus::Ok,
                     usage_present,
+                    prompt_tokens,
+                    completion_tokens,
                 },
                 response: Some(resp),
             }
@@ -213,6 +261,8 @@ async fn run_arm(
                     latency_ms,
                     status: ArmStatus::Error,
                     usage_present: false,
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 },
                 response: None,
             }
@@ -221,17 +271,26 @@ async fn run_arm(
 }
 
 impl<R: ProviderResolver> Orchestrator<R> {
-    /// Execute a MoA recipe end-to-end and return a single fused completion.
+    /// Execute a MoA recipe end-to-end and return a [`MoaRun`].
     ///
     /// Steps: resolve recipe (unknown => `model_not_found`), fan out proposers,
     /// enforce quorum, build the fixed aggregation prompt, call the aggregator,
     /// and sum usage across all successful proposers + the aggregator.
+    ///
+    /// **Always-carry-outcomes contract (plan §8③):** every return *after* the
+    /// fan-out has run constructs a [`MoaRun`] carrying the proposer (and any
+    /// aggregator) outcomes — even on quorum failure, aggregator-resolve failure,
+    /// aggregator timeout, or aggregator error — so the app can book a usage row
+    /// per arm that already incurred cost. Only the pre-fan-out `ModelNotFound`
+    /// (no arm has run yet) returns a plain `Err`.
     pub async fn run(
         &self,
         ctx: &ReqCtx,
         recipe_name: &str,
         request: ChatRequest,
-    ) -> Result<MoaResult> {
+    ) -> Result<MoaRun> {
+        // EXEMPT early return: recipe unknown, before any arm runs → booking 0
+        // rows is correct, so this stays a plain `Err` (NOT routed through MoaRun).
         let recipe = self
             .recipe(recipe_name)
             .ok_or_else(|| Error::ModelNotFound {
@@ -243,7 +302,7 @@ impl<R: ProviderResolver> Orchestrator<R> {
 
         // Partition into successes and outcomes. `FuturesUnordered` yields arms
         // in completion order, so we keep each arm's recipe index and sort both
-        // collections by it: `MoaResult::arms` is documented as recipe order, and
+        // collections by it: proposer outcomes are documented as recipe order, and
         // candidate numbering must be stable/deterministic for the aggregator.
         let mut outcomes_idx: Vec<(usize, ArmOutcome)> = Vec::with_capacity(arms.len());
         let mut successes: Vec<(usize, moaray_core::types::ChatResponse)> = Vec::new();
@@ -255,13 +314,20 @@ impl<R: ProviderResolver> Orchestrator<R> {
         }
         outcomes_idx.sort_by_key(|(i, _)| *i);
         successes.sort_by_key(|(i, _)| *i);
-        let outcomes: Vec<ArmOutcome> = outcomes_idx.into_iter().map(|(_, o)| o).collect();
+        let proposers: Vec<ArmOutcome> = outcomes_idx.into_iter().map(|(_, o)| o).collect();
 
         let succeeded = successes.len();
         if succeeded < recipe.quorum {
-            return Err(Error::MoaQuorumFailed {
-                succeeded,
-                required: recipe.quorum,
+            // Quorum failed AFTER the proposers ran (and incurred cost). Surface
+            // their outcomes so the app books survivor + failed-arm rows; no
+            // aggregator ran (it must not be called when quorum fails).
+            return Ok(MoaRun {
+                proposers,
+                aggregator: None,
+                outcome: Err(Error::MoaQuorumFailed {
+                    succeeded,
+                    required: recipe.quorum,
+                }),
             });
         }
 
@@ -273,10 +339,19 @@ impl<R: ProviderResolver> Orchestrator<R> {
             .collect();
         let agg_req = build_aggregator_request(&recipe, &request, &candidates);
 
-        let agg_provider = self
-            .resolver
-            .resolve(&recipe.aggregator)
-            .ok_or(Error::Internal)?;
+        // Aggregator-resolve early return (plan P1-② — orchestrator.rs:279): this
+        // fires AFTER fan-out + quorum pass, so proposers already incurred cost.
+        // Surface their outcomes via MoaRun instead of dropping them with `?`.
+        let agg_provider = match self.resolver.resolve(&recipe.aggregator) {
+            Some(p) => p,
+            None => {
+                return Ok(MoaRun {
+                    proposers,
+                    aggregator: None,
+                    outcome: Err(Error::Internal),
+                });
+            }
+        };
         let agg_timeout = effective_timeout(ctx.deadline, recipe.arm_timeout_ms);
         let agg_upstream_id = agg_provider.upstream_id().to_string();
         let agg_start = Instant::now();
@@ -291,17 +366,50 @@ impl<R: ProviderResolver> Orchestrator<R> {
         let agg_latency_ms = agg_start.elapsed().as_millis() as u64;
 
         let mut agg_resp = match agg_result {
-            Err(_) => return Err(Error::UpstreamTimeout),
+            // Aggregator timeout/error: book a failed aggregator row + surface the
+            // gateway error (proposers already booked via `proposers`).
+            Err(_) => {
+                return Ok(MoaRun {
+                    proposers,
+                    aggregator: Some(ArmOutcome {
+                        model: recipe.aggregator.clone(),
+                        upstream_id: agg_upstream_id,
+                        latency_ms: agg_latency_ms,
+                        status: ArmStatus::Timeout,
+                        usage_present: false,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                    }),
+                    outcome: Err(Error::UpstreamTimeout),
+                });
+            }
             Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                return Ok(MoaRun {
+                    proposers,
+                    aggregator: Some(ArmOutcome {
+                        model: recipe.aggregator.clone(),
+                        upstream_id: agg_upstream_id,
+                        latency_ms: agg_latency_ms,
+                        status: ArmStatus::Error,
+                        usage_present: false,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                    }),
+                    outcome: Err(e),
+                });
+            }
         };
 
+        let (agg_pt, agg_ct) = extract_tokens(agg_resp.usage.as_ref());
         let aggregator = ArmOutcome {
             model: recipe.aggregator.clone(),
             upstream_id: agg_upstream_id,
             latency_ms: agg_latency_ms,
             status: ArmStatus::Ok,
             usage_present: agg_resp.usage.is_some(),
+            prompt_tokens: agg_pt,
+            completion_tokens: agg_ct,
         };
 
         // usage = sum over successful proposers + aggregator.
@@ -318,10 +426,10 @@ impl<R: ProviderResolver> Orchestrator<R> {
         agg_resp.model = Some(ctx.model.clone());
         agg_resp.usage = Some(summed);
 
-        Ok(MoaResult {
-            response: agg_resp,
-            arms: outcomes,
-            aggregator,
+        Ok(MoaRun {
+            proposers,
+            aggregator: Some(aggregator),
+            outcome: Ok(agg_resp),
         })
     }
 
@@ -365,6 +473,18 @@ mod tests {
     use moaray_core::types::{ChatRequest, ChatResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
+
+    /// Test helper: assert the run produced an Ok outcome and return the fused
+    /// response, the proposer outcomes, and the (present) aggregator outcome.
+    fn expect_ok(run: MoaRun) -> (ChatResponse, Vec<ArmOutcome>, ArmOutcome) {
+        let MoaRun {
+            proposers,
+            aggregator,
+            outcome,
+        } = run;
+        let response = outcome.expect("run outcome ok");
+        (response, proposers, aggregator.expect("aggregator present"))
+    }
 
     /// A controllable fake provider for fan-out tests.
     struct FakeProvider {
@@ -533,30 +653,22 @@ mod tests {
         let res = orch
             .run(&ctx(5_000), "arm-e", user_request())
             .await
-            .expect("quorum met");
+            .expect("run completes");
+        let (response, arms, _agg) = expect_ok(res);
 
-        assert_eq!(extract_text(&res.response), "fused");
-        assert_eq!(res.response.model.as_deref(), Some("moa/arm-e"));
+        assert_eq!(extract_text(&response), "fused");
+        assert_eq!(response.model.as_deref(), Some("moa/arm-e"));
         assert_eq!(agg_calls.load(Ordering::SeqCst), 1);
         // usage = 3 successful proposers (10/20/30) + aggregator (5) summed
-        let usage = res.response.usage.unwrap();
+        let usage = response.usage.unwrap();
         assert_eq!(usage["prompt_tokens"], serde_json::json!(65));
         assert_eq!(usage["completion_tokens"], serde_json::json!(65));
         assert_eq!(usage["total_tokens"], serde_json::json!(130));
         // 4 arm outcomes, one of them error
-        assert_eq!(res.arms.len(), 4);
+        assert_eq!(arms.len(), 4);
+        assert_eq!(arms.iter().filter(|a| a.status == ArmStatus::Ok).count(), 3);
         assert_eq!(
-            res.arms
-                .iter()
-                .filter(|a| a.status == ArmStatus::Ok)
-                .count(),
-            3
-        );
-        assert_eq!(
-            res.arms
-                .iter()
-                .filter(|a| a.status == ArmStatus::Error)
-                .count(),
+            arms.iter().filter(|a| a.status == ArmStatus::Error).count(),
             1
         );
     }
@@ -603,10 +715,24 @@ mod tests {
         .collect();
         let orch = Orchestrator::new(resolver, recipes);
 
-        let err = orch
+        let run = orch
             .run(&ctx(5_000), "arm-e", user_request())
             .await
-            .expect_err("quorum not met");
+            .expect("run completes");
+        // Quorum failure now surfaces via MoaRun: outcome is Err, but the
+        // proposer outcomes are still carried (so the app books survivor rows),
+        // and the aggregator is None (it must not run when quorum fails).
+        assert!(run.aggregator.is_none(), "aggregator must not run");
+        assert_eq!(run.proposers.len(), 4, "all proposer outcomes carried");
+        assert_eq!(
+            run.proposers
+                .iter()
+                .filter(|a| a.status == ArmStatus::Ok)
+                .count(),
+            2,
+            "2 survivors carried"
+        );
+        let err = run.outcome.expect_err("quorum not met");
         match err {
             Error::MoaQuorumFailed {
                 succeeded,
@@ -620,6 +746,55 @@ mod tests {
         assert_eq!(err.envelope().status, 503);
         // aggregator must NOT be called when quorum fails
         assert_eq!(agg_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Aggregator provider missing (resolve→None) AFTER quorum passes: the
+    /// proposers already incurred cost, so their outcomes must still be carried
+    /// (plan P1-② — the orchestrator.rs:279 early return). aggregator is None and
+    /// outcome is Err(Internal).
+    #[tokio::test]
+    async fn aggregator_unresolvable_after_quorum_still_carries_proposers() {
+        let mut resolver = MapResolver::new();
+        let (p1, c1) = FakeProvider::new(
+            "u1",
+            Behavior::Ok {
+                content: "ans1".into(),
+                tokens: 10,
+            },
+        );
+        let (p2, c2) = FakeProvider::new(
+            "u2",
+            Behavior::Ok {
+                content: "ans2".into(),
+                tokens: 20,
+            },
+        );
+        resolver.insert("a", p1);
+        resolver.insert("b", p2);
+        // NOTE: deliberately do NOT insert "agg" — the aggregator resolve fails
+        // after the proposers have already run.
+        let recipes = std::iter::once(recipe(Strategy::ConcatSynthesize, vec!["a", "b"], 2))
+            .map(|r| (r.name.clone(), r))
+            .collect();
+        let orch = Orchestrator::new(resolver, recipes);
+
+        let run = orch
+            .run(&ctx(5_000), "arm-e", user_request())
+            .await
+            .expect("run completes");
+        // Both proposers ran (incurred cost) and their outcomes are carried.
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 1);
+        assert_eq!(run.proposers.len(), 2);
+        assert!(
+            run.proposers.iter().all(|a| a.status == ArmStatus::Ok),
+            "both proposers succeeded and are booked"
+        );
+        assert!(run.aggregator.is_none(), "aggregator never resolved");
+        assert!(
+            matches!(run.outcome, Err(Error::Internal)),
+            "aggregator-resolve failure maps to Internal"
+        );
     }
 
     /// A slow arm times out but does not block the others; quorum still met.
@@ -663,15 +838,15 @@ mod tests {
         let res = orch
             .run(&ctx(10_000), "arm-e", user_request())
             .await
-            .expect("quorum met despite slow arm");
+            .expect("run completes despite slow arm");
+        let (response, arms, _agg) = expect_ok(res);
         // Completes well under the 5s slow-arm sleep (arm timeout is 200ms).
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "slow arm blocked the fan-out"
         );
-        assert_eq!(extract_text(&res.response), "fused");
-        let timed_out = res
-            .arms
+        assert_eq!(extract_text(&response), "fused");
+        let timed_out = arms
             .iter()
             .filter(|a| a.status == ArmStatus::Timeout)
             .count();
@@ -780,12 +955,13 @@ mod tests {
         let res = orch
             .run(&ctx(5_000), "arm-e", user_request())
             .await
-            .unwrap();
-        let usage = res.response.usage.unwrap();
+            .expect("run completes");
+        let (response, arms, _agg) = expect_ok(res);
+        let usage = response.usage.unwrap();
         // p1(10) + agg(5) = 15 (p2 contributed nothing)
         assert_eq!(usage["prompt_tokens"], serde_json::json!(15));
         // one proposer arm flagged usage missing
-        assert_eq!(res.arms.iter().filter(|a| !a.usage_present).count(), 1);
+        assert_eq!(arms.iter().filter(|a| !a.usage_present).count(), 1);
     }
 
     /// quorum-judge resolves and the judge receives all successful candidates.
@@ -862,8 +1038,9 @@ mod tests {
         let res = orch
             .run(&ctx(5_000), "arm-e", user_request())
             .await
-            .unwrap();
-        assert_eq!(extract_text(&res.response), "best");
+            .expect("run completes");
+        let (response, _arms, _agg) = expect_ok(res);
+        assert_eq!(extract_text(&response), "best");
         assert_eq!(seen.load(Ordering::SeqCst), 3, "judge saw all 3 candidates");
     }
 

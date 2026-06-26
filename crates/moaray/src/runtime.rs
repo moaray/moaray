@@ -301,28 +301,52 @@ pub struct AppState {
     pub runtime: Arc<ArcSwap<Runtime>>,
     /// Persisted across config hot-swaps; holds the limiter/breaker state.
     pub stateful: Arc<StatefulState>,
+    /// The usage-accounting sink (process-lifetime, like `stateful`; NOT in the
+    /// hot-swappable `Runtime`). `record`-only and non-blocking; defaults to a
+    /// `NullSink` when no `usage_store` is configured. The matching
+    /// `UsageWriterHandle` for shutdown flushing is held by `main()`, OUT of state.
+    pub usage_sink: Arc<dyn moaray_core::usage::UsageSink>,
 }
 
 impl AppState {
     /// Build app state from an initial runtime, deriving the stateful layer from
     /// the same config. Convenience for tests; production wiring builds the
     /// stateful layer first (so providers can be wrapped) via
-    /// [`AppState::with_stateful`].
+    /// [`AppState::with_stateful`]. Accounting is disabled (`NullSink`).
     pub fn new(runtime: Runtime) -> Self {
         let stateful = Arc::new(StatefulState::from_config(&runtime.config));
         Self {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             stateful,
+            usage_sink: Arc::new(moaray_store::NullSink),
         }
     }
 
     /// Build app state from a runtime and a pre-built stateful layer. Used by the
     /// bin so the provider registry can be wrapped against the same stateful
-    /// slots the handlers will read.
+    /// slots the handlers will read. Accounting is disabled (`NullSink`).
     pub fn with_stateful(runtime: Runtime, stateful: Arc<StatefulState>) -> Self {
         Self {
             runtime: Arc::new(ArcSwap::from_pointee(runtime)),
             stateful,
+            usage_sink: Arc::new(moaray_store::NullSink),
+        }
+    }
+
+    /// Build app state with an injected usage sink. The bin uses this to wire the
+    /// real `SqliteSink`; tests use it to inject a `VecSink` and read back the
+    /// rows a request booked — the seam that makes the accounting gates
+    /// non-vacuous (without it `NullSink.record` is a no-op and assertions would
+    /// pass on an empty set).
+    pub fn with_sink(
+        runtime: Runtime,
+        stateful: Arc<StatefulState>,
+        usage_sink: Arc<dyn moaray_core::usage::UsageSink>,
+    ) -> Self {
+        Self {
+            runtime: Arc::new(ArcSwap::from_pointee(runtime)),
+            stateful,
+            usage_sink,
         }
     }
 

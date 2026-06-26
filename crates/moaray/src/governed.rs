@@ -380,6 +380,7 @@ mod tests {
                     status: 200,
                     content_type: None,
                     body: empty_stream(),
+                    usage: None,
                 }),
                 Mode::AlwaysErr(f) => Err(f()),
             }
@@ -391,6 +392,7 @@ mod tests {
                     status: 200,
                     content_type: Some("text/event-stream".into()),
                     body: empty_stream(),
+                    usage: None,
                 }),
                 Mode::AlwaysErr(f) => Err(f()),
             }
@@ -753,6 +755,7 @@ mod tests {
                         status: 200,
                         content_type: None,
                         body: empty_stream(),
+                        usage: None,
                     })
                 }
             }

@@ -19,6 +19,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use moaray_core::error::Error;
 use moaray_core::provider::ReqCtx;
 use moaray_core::router::{route, RouteTarget};
+use moaray_core::usage::{compute_cost, UsageArm, UsagePath, UsageRecord, UsageStatus};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -147,6 +148,11 @@ enum Routed {
         model: String,
         stream: bool,
         provider: std::sync::Arc<dyn moaray_core::provider::Provider>,
+        /// The runtime snapshot this request was routed against. Carried so the
+        /// per-model price used for the usage row comes from the SAME config the
+        /// provider was resolved from — not a live snapshot a hot reload may have
+        /// swapped mid-request (mirrors `Routed::Moa.runtime`, codex C1).
+        runtime: std::sync::Arc<crate::runtime::Runtime>,
     },
     Moa {
         caller_key_id: String,
@@ -198,7 +204,13 @@ async fn chat_completions(
             model,
             stream,
             provider,
-        } => passthrough(ctx, request_id, auth, raw, model, stream, started, provider).await,
+            runtime,
+        } => {
+            passthrough(
+                ctx, runtime, request_id, auth, raw, model, stream, started, provider,
+            )
+            .await
+        }
         Routed::Moa {
             caller_key_id,
             recipe,
@@ -281,6 +293,7 @@ async fn pre_route(ctx: &ServerCtx, req: Request) -> Result<Routed, Error> {
                 model,
                 stream,
                 provider,
+                runtime: rt.clone(),
             })
         }
         RouteTarget::Moa { recipe } => {
@@ -305,6 +318,7 @@ async fn pre_route(ctx: &ServerCtx, req: Request) -> Result<Routed, Error> {
 #[allow(clippy::too_many_arguments)]
 async fn passthrough(
     ctx: ServerCtx,
+    runtime: std::sync::Arc<crate::runtime::Runtime>,
     request_id: String,
     auth: crate::auth::AuthContext,
     raw: Bytes,
@@ -316,7 +330,7 @@ async fn passthrough(
     // Read the per-request timeout from the live config snapshot (hot-reloadable).
     let request_timeout = ctx.request_timeout();
     let rctx = ReqCtx {
-        request_id,
+        request_id: request_id.clone(),
         deadline: Instant::now() + request_timeout,
         caller_key_id: auth.key_id.clone(),
         model: model.clone(),
@@ -348,6 +362,39 @@ async fn passthrough(
                 status,
                 started.elapsed().as_secs_f64(),
             );
+            if stream {
+                // Streaming usage is not tapped this period (would buffer the SSE
+                // stream); make the gap observable instead of silent (Step 6b).
+                metrics::counter!("moaray_usage_unaccounted_stream_total").increment(1);
+            } else {
+                // Non-stream: book ONE usage row from the tapped `raw_resp.usage`,
+                // priced from the routed snapshot's per-model price (codex C1).
+                let (price_p, price_c) = model_prices(&runtime, &model);
+                let (pt, ct) = match raw_resp.usage {
+                    Some((p, c)) => (Some(p), Some(c)),
+                    None => (None, None),
+                };
+                let status_kind = usage_status(pt, ct, price_p, price_c);
+                if matches!(status_kind, UsageStatus::Unpriced) {
+                    metrics::counter!("moaray_usage_unpriced_total").increment(1);
+                }
+                let cost = compute_cost(pt, ct, price_p, price_c);
+                ctx.state.usage_sink.record(UsageRecord {
+                    request_id: request_id.clone(),
+                    ts_unix_ms: now_unix_ms(),
+                    path: UsagePath::Passthrough,
+                    arm: UsageArm::Passthrough,
+                    model: model.clone(),
+                    upstream_id: provider.upstream_id().to_string(),
+                    caller_key_id: auth.key_id.clone(),
+                    prompt_tokens: pt,
+                    completion_tokens: ct,
+                    price_prompt_nano_per_mtok: price_p,
+                    price_completion_nano_per_mtok: price_c,
+                    cost_nano_usd: cost,
+                    status: status_kind,
+                });
+            }
             Ok(into_response(raw_resp, stream))
         }
         Err(e) => {
@@ -358,14 +405,64 @@ async fn passthrough(
                 status,
                 started.elapsed().as_secs_f64(),
             );
+            // A failed non-stream passthrough books NO usage row (no tokens to
+            // count) — intentionally asymmetric with MoA's explicit failed-arm
+            // rows (plan §5). Streaming failures likewise book no row.
             Err(e.into())
         }
     }
 }
 
-/// MoA path: parse the full request, run the orchestrator, render the single
-/// fused completion (usage summed), record per-arm metrics, and — only when the
-/// config toggle is on — attach the `moaray` debug extension field.
+/// Current wall-clock time in unix milliseconds (saturating, never negative).
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Resolve the `(prompt, completion)` nano-USD-per-Mtok price for a model from a
+/// pinned runtime snapshot. `(None, None)` when the model is unknown/unpriced.
+fn model_prices(runtime: &crate::runtime::Runtime, model: &str) -> (Option<i64>, Option<i64>) {
+    runtime
+        .config
+        .models
+        .get(model)
+        .map(|m| {
+            (
+                m.price_prompt_nano_per_mtok,
+                m.price_completion_nano_per_mtok,
+            )
+        })
+        .unwrap_or((None, None))
+}
+
+/// Map measured tokens + a price snapshot to a [`UsageStatus`].
+///
+/// `(tokens present, price present)` → `ok`; `(tokens present, price absent)` →
+/// `unpriced`; `(tokens absent, _)` → `ok_no_usage`. Failed/timeout statuses are
+/// set by their own call sites, not here.
+fn usage_status(
+    pt: Option<i64>,
+    ct: Option<i64>,
+    price_p: Option<i64>,
+    price_c: Option<i64>,
+) -> UsageStatus {
+    match (
+        pt.is_some() && ct.is_some(),
+        price_p.is_some() && price_c.is_some(),
+    ) {
+        (false, _) => UsageStatus::OkNoUsage,
+        (true, true) => UsageStatus::Ok,
+        (true, false) => UsageStatus::Unpriced,
+    }
+}
+
+/// MoA path: parse the full request, run the orchestrator, book a usage row per
+/// arm (unconditionally, even on failure — so failed runs still bill the arms
+/// that incurred cost), emit per-arm metrics in lockstep, then map the run's
+/// outcome to the HTTP response.
 #[allow(clippy::too_many_arguments)]
 async fn run_moa(
     ctx: ServerCtx,
@@ -382,42 +479,73 @@ async fn run_moa(
         .map_err(|e| Error::BadRequest(format!("invalid request: {e}")))?;
 
     let rctx = ReqCtx {
-        request_id,
+        request_id: request_id.clone(),
         deadline: Instant::now() + ctx.request_timeout(),
-        caller_key_id,
+        caller_key_id: caller_key_id.clone(),
         model: model.clone(),
     };
 
-    let result = runtime.orchestrator.run(&rctx, &recipe, request).await;
-
-    match result {
-        Ok(moa) => {
-            // Per-arm metrics (proposers + aggregator); low-cardinality labels.
-            for arm in &moa.arms {
-                record_moa_arm(
-                    &arm.model,
-                    &arm.upstream_id,
-                    arm.status.as_str(),
-                    arm.latency_ms as f64 / 1000.0,
-                );
-            }
-            record_moa_arm(
-                &moa.aggregator.model,
-                &moa.aggregator.upstream_id,
-                moa.aggregator.status.as_str(),
-                moa.aggregator.latency_ms as f64 / 1000.0,
+    // The pre-fan-out ModelNotFound is the only Err here (no arm ran → book 0
+    // rows, correct). Everything else is a MoaRun carrying the arm outcomes.
+    let run = match runtime.orchestrator.run(&rctx, &recipe, request).await {
+        Ok(run) => run,
+        Err(e) => {
+            let status = e.envelope().status;
+            record_request(
+                RequestPath::Moa,
+                &model,
+                status,
+                started.elapsed().as_secs_f64(),
             );
+            return Err(e.into());
+        }
+    };
+
+    // Book a usage row + emit a per-arm metric for EVERY arm that ran — proposers
+    // and the aggregator (if any) — UNCONDITIONALLY, before mapping the outcome.
+    // This keeps the usage rows and the moaray_moa_arm_total metric series in
+    // lockstep even for failed runs (plan P1-④ + §8③).
+    let ts = now_unix_ms();
+    for arm in &run.proposers {
+        book_moa_arm(
+            &ctx,
+            &runtime,
+            &request_id,
+            &caller_key_id,
+            &model,
+            ts,
+            UsageArm::Proposer,
+            arm,
+        );
+    }
+    if let Some(agg) = &run.aggregator {
+        book_moa_arm(
+            &ctx,
+            &runtime,
+            &request_id,
+            &caller_key_id,
+            &model,
+            ts,
+            UsageArm::Aggregator,
+            agg,
+        );
+    }
+
+    match run.outcome {
+        Ok(response) => {
             record_request(
                 RequestPath::Moa,
                 &model,
                 200,
                 started.elapsed().as_secs_f64(),
             );
-
-            let mut body = serde_json::to_value(&moa.response).unwrap_or_else(|_| json!({}));
+            let mut body = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
             if ctx.moa_expose_metadata() {
                 if let Some(obj) = body.as_object_mut() {
-                    obj.insert("moaray".to_string(), moa_metadata(&moa));
+                    obj.insert(
+                        "moaray".to_string(),
+                        moa_metadata(&run.proposers, run.aggregator.as_ref()),
+                    );
                 }
             }
             Ok(axum::Json(body).into_response())
@@ -435,9 +563,65 @@ async fn run_moa(
     }
 }
 
+/// Emit one arm's per-arm metric AND book its usage row (priced from the routed
+/// snapshot). Called unconditionally for every arm that ran.
+#[allow(clippy::too_many_arguments)]
+fn book_moa_arm(
+    ctx: &ServerCtx,
+    runtime: &crate::runtime::Runtime,
+    request_id: &str,
+    caller_key_id: &str,
+    model: &str,
+    ts_unix_ms: i64,
+    arm_kind: UsageArm,
+    arm: &moaray_moa::ArmOutcome,
+) {
+    record_moa_arm(
+        &arm.model,
+        &arm.upstream_id,
+        arm.status.as_str(),
+        arm.latency_ms as f64 / 1000.0,
+    );
+
+    let (price_p, price_c) = model_prices(runtime, &arm.model);
+    // Map the orchestrator ArmStatus → the persisted UsageStatus, applying the
+    // unpriced override when tokens are present but no price is configured.
+    let status = match arm.status {
+        moaray_moa::ArmStatus::Timeout => UsageStatus::Timeout,
+        moaray_moa::ArmStatus::Error => UsageStatus::Failed,
+        moaray_moa::ArmStatus::Ok => {
+            usage_status(arm.prompt_tokens, arm.completion_tokens, price_p, price_c)
+        }
+    };
+    if matches!(status, UsageStatus::Unpriced) {
+        metrics::counter!("moaray_usage_unpriced_total").increment(1);
+    }
+    // Cost is only computed for ok+priced rows; failed/timeout/unmeasured → NULL.
+    let cost = compute_cost(arm.prompt_tokens, arm.completion_tokens, price_p, price_c);
+    ctx.state.usage_sink.record(UsageRecord {
+        request_id: request_id.to_string(),
+        ts_unix_ms,
+        path: UsagePath::Moa,
+        arm: arm_kind,
+        model: arm.model.clone(),
+        upstream_id: arm.upstream_id.clone(),
+        caller_key_id: caller_key_id.to_string(),
+        prompt_tokens: arm.prompt_tokens,
+        completion_tokens: arm.completion_tokens,
+        price_prompt_nano_per_mtok: price_p,
+        price_completion_nano_per_mtok: price_c,
+        cost_nano_usd: cost,
+        status,
+    });
+    let _ = model; // model (the moa/* name) is carried on the request, not the arm row
+}
+
 /// Build the optional `moaray` extension object: per-arm metadata (model,
 /// upstream_id, latency, status). No secrets, no raw upstream error bodies.
-fn moa_metadata(moa: &moaray_moa::MoaResult) -> Value {
+fn moa_metadata(
+    proposers: &[moaray_moa::ArmOutcome],
+    aggregator: Option<&moaray_moa::ArmOutcome>,
+) -> Value {
     let arm_json = |a: &moaray_moa::ArmOutcome| {
         json!({
             "model": a.model,
@@ -447,10 +631,10 @@ fn moa_metadata(moa: &moaray_moa::MoaResult) -> Value {
             "usage_present": a.usage_present,
         })
     };
-    let arms: Vec<Value> = moa.arms.iter().map(arm_json).collect();
+    let arms: Vec<Value> = proposers.iter().map(arm_json).collect();
     json!({
         "arms": arms,
-        "aggregator": arm_json(&moa.aggregator),
+        "aggregator": aggregator.map(arm_json),
     })
 }
 

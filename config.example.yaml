@@ -19,6 +19,17 @@ server:
     enabled: false
     max_retries: 2
     backoff_ms: 100            # doubles each attempt
+  # Persistent usage/cost accounting store (v0.2-P1). OMIT this block to disable
+  # accounting entirely (a NullSink — zero overhead). When present, one row per
+  # upstream call (each MoA proposer, the aggregator, each non-stream passthrough)
+  # is written to SQLite with raw token counts + a price snapshot + a computed
+  # cost. Best-effort/telemetry-grade: under overload rows are dropped, never
+  # blocking a user request. These knobs are RESTART-FROZEN (a hot reload warns
+  # and keeps the running store). Per-model PRICES below are hot-reloadable.
+  # usage_store:
+  #   path: /var/lib/moaray/usage.db   # SQLite file (created if absent; WAL mode)
+  #   channel_capacity: 8192           # hot-path → writer queue depth (drop-on-full)
+  #   batch_size: 256                  # rows per write transaction
 
 auth:
   keys:
@@ -45,6 +56,11 @@ models:
     # to the same upstream identity (MoA fan-out cannot bypass them).
     # rate_limit: {rps: 100, burst: 200}
     # max_concurrency: 64                 # in-flight request ceiling
+    # Optional per-model token prices in USD per 1M tokens. Set BOTH to price this
+    # model's usage rows; omit either and rows store tokens with cost=NULL and
+    # status=unpriced (and bump moaray_usage_unpriced_total). Hot-reloadable.
+    # price_prompt_per_mtok_usd: 0.15
+    # price_completion_per_mtok_usd: 0.60
 
 # MoA recipes: fan-out to the proposers in parallel, then fuse with the
 # aggregator. Activated in Phase 2. Call them via `model: "moa/<recipe>"`.
