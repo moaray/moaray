@@ -36,6 +36,7 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 arc-swap.workspace = true
+dashmap.workspace = true
 governor.workspace = true
 uuid.workspace = true
 anyhow.workspace = true

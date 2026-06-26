@@ -45,7 +45,7 @@ pub struct ServerConfig {
 }
 
 /// Validated per-upstream circuit-breaker thresholds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BreakerConfig {
     pub failure_threshold: u32,
     pub open_ms: u64,
@@ -122,11 +122,36 @@ pub struct ModelConfig {
     pub base_url: String,
     /// Env var name holding the upstream key (resolved at provider build time).
     pub api_key_env: String,
+    /// Internal **state key** — `provider_type|base_url|api_key_env`. Keys the
+    /// per-upstream limiter/concurrency/breaker in `StatefulState`. Derived (never
+    /// user-set) so renaming a model keeps its state (base_url/key unchanged) and
+    /// two aliases of the same upstream share one bucket (no per-upstream-cap
+    /// bypass). **Internal only:** it contains `base_url` and must NEVER reach a
+    /// metric label or client response (that is what the low-cardinality
+    /// `upstream_id` is for — see no-secret-logging rule).
+    pub state_key: String,
+    /// Human-facing, low-cardinality observability label (the Prometheus
+    /// `upstream_id` label and the client `moaray` debug field). Defaults to
+    /// `name`. Decoupled from `state_key`: relabeling it never moves a bucket.
     pub upstream_id: String,
     /// Optional per-upstream rate limit (shared across passthrough + MoA arms).
     pub rate_limit: Option<RateLimit>,
     /// Optional per-upstream concurrency cap. `None` means unbounded.
     pub max_concurrency: Option<u32>,
+}
+
+impl ModelConfig {
+    /// Build the internal state key from the identity triple
+    /// (`provider_type|base_url|api_key_env`). Stable across model renames and
+    /// `upstream_id` relabels; changes only when the upstream identity (URL or
+    /// account/key env) changes, which correctly forces a fresh bucket/breaker.
+    pub fn derive_state_key(
+        provider_type: ProviderType,
+        base_url: &str,
+        api_key_env: &str,
+    ) -> String {
+        format!("{}|{}|{}", provider_type.as_str(), base_url, api_key_env)
+    }
 }
 
 impl fmt::Debug for ModelConfig {
@@ -138,6 +163,7 @@ impl fmt::Debug for ModelConfig {
             .field("provider_type", &self.provider_type)
             .field("base_url", &self.base_url)
             .field("api_key_env", &self.api_key_env)
+            .field("state_key", &self.state_key)
             .field("upstream_id", &self.upstream_id)
             .field("rate_limit", &self.rate_limit)
             .field("max_concurrency", &self.max_concurrency)

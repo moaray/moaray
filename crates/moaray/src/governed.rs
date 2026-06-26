@@ -405,11 +405,11 @@ mod tests {
     }
 
     fn state() -> Arc<UpstreamState> {
-        Arc::new(UpstreamState {
-            limiter: None,
-            concurrency: crate::limit::Concurrency::new(None),
-            breaker: crate::breaker::CircuitBreaker::new(breaker_cfg()),
-        })
+        Arc::new(UpstreamState::from_parts(
+            None,
+            crate::limit::Concurrency::new(None),
+            crate::breaker::CircuitBreaker::new(breaker_cfg()),
+        ))
     }
 
     #[tokio::test]
@@ -472,14 +472,14 @@ mod tests {
             calls: AtomicUsize::new(0),
             mode: Mode::AlwaysOk,
         });
-        let st = Arc::new(UpstreamState {
-            limiter: Some(crate::limit::TokenBucket::new(RateLimit {
+        let st = Arc::new(UpstreamState::from_parts(
+            Some(crate::limit::TokenBucket::new(RateLimit {
                 rps: 1,
                 burst: 1,
             })),
-            concurrency: crate::limit::Concurrency::new(None),
-            breaker: crate::breaker::CircuitBreaker::new(breaker_cfg()),
-        });
+            crate::limit::Concurrency::new(None),
+            crate::breaker::CircuitBreaker::new(breaker_cfg()),
+        ));
         let g = GovernedProvider::new(inner.clone(), st, retry_off());
         assert!(g.passthrough(&ctx(), Bytes::new()).await.is_ok());
         // second call over the bucket -> rate limited, upstream not called again.
@@ -496,15 +496,15 @@ mod tests {
             calls: AtomicUsize::new(0),
             mode: Mode::AlwaysOk,
         });
-        let st = Arc::new(UpstreamState {
-            limiter: None,
-            concurrency: crate::limit::Concurrency::new(None),
-            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+        let st = Arc::new(UpstreamState::from_parts(
+            None,
+            crate::limit::Concurrency::new(None),
+            crate::breaker::CircuitBreaker::new(BreakerConfig {
                 failure_threshold: 1,
                 open_ms: 60_000,
                 half_open_successes: 1,
             }),
-        });
+        ));
         // Trip the breaker.
         st.breaker.on_failure(Admission::Normal);
         let g = GovernedProvider::new(inner.clone(), st, retry_off());
@@ -516,15 +516,15 @@ mod tests {
     }
 
     fn breaker_with_threshold(threshold: u32) -> Arc<UpstreamState> {
-        Arc::new(UpstreamState {
-            limiter: None,
-            concurrency: crate::limit::Concurrency::new(None),
-            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+        Arc::new(UpstreamState::from_parts(
+            None,
+            crate::limit::Concurrency::new(None),
+            crate::breaker::CircuitBreaker::new(BreakerConfig {
                 failure_threshold: threshold,
                 open_ms: 60_000,
                 half_open_successes: 1,
             }),
-        })
+        ))
     }
 
     /// P1 regression: an upstream **4xx** (`UpstreamClientError`) is the
@@ -652,15 +652,15 @@ mod tests {
     #[tokio::test]
     async fn cancelled_half_open_probe_does_not_wedge_the_breaker() {
         let inner = Arc::new(StallProvider);
-        let st = Arc::new(UpstreamState {
-            limiter: None,
-            concurrency: crate::limit::Concurrency::new(None),
-            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+        let st = Arc::new(UpstreamState::from_parts(
+            None,
+            crate::limit::Concurrency::new(None),
+            crate::breaker::CircuitBreaker::new(BreakerConfig {
                 failure_threshold: 1,
                 open_ms: 0, // cooldown immediately elapsed -> next call probes
                 half_open_successes: 1,
             }),
-        });
+        ));
         // Trip the breaker open.
         st.breaker.on_failure(Admission::Normal);
         let g = GovernedProvider::new(inner, st.clone(), retry_off());
@@ -689,15 +689,15 @@ mod tests {
     /// the half-open race the admission token closes.
     #[test]
     fn normal_admission_probe_guard_is_inert_and_does_not_release_a_real_probe() {
-        let st = Arc::new(UpstreamState {
-            limiter: None,
-            concurrency: crate::limit::Concurrency::new(None),
-            breaker: crate::breaker::CircuitBreaker::new(BreakerConfig {
+        let st = Arc::new(UpstreamState::from_parts(
+            None,
+            crate::limit::Concurrency::new(None),
+            crate::breaker::CircuitBreaker::new(BreakerConfig {
                 failure_threshold: 1,
                 open_ms: 0, // cooldown immediately elapsed -> next check probes
                 half_open_successes: 1,
             }),
-        });
+        ));
         // Trip open, then admit the single real probe (breaker -> half-open,
         // probe_in_flight = true).
         st.breaker.on_failure(Admission::Normal);

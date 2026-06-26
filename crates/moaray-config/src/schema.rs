@@ -210,7 +210,14 @@ pub struct ModelDoc {
     pub base_url: String,
     /// Env var holding the upstream API key. Never inline the secret.
     pub api_key_env: String,
-    /// Stable id for stateful keying (limiter/breaker). Defaults to `name`.
+    /// **Deprecated as a state key.** Optional human-facing, low-cardinality
+    /// *observability* label (Prometheus `upstream_id` + the client `moaray`
+    /// debug field). Defaults to `name`. It no longer keys the limiter/breaker
+    /// state — that is the internal `state_key` derived from
+    /// `provider_type|base_url|api_key_env` (see runtime `ModelConfig::state_key`),
+    /// so two aliases of the same upstream cannot bypass the per-upstream cap and
+    /// renaming a model never resets its rate-limit/breaker state. Setting it does
+    /// NOT change which models share a bucket; it only relabels metrics/responses.
     #[serde(default)]
     pub upstream_id: Option<String>,
     /// Optional per-upstream rate limit. Shared by passthrough and MoA arms that
@@ -229,6 +236,19 @@ pub struct ModelDoc {
 pub enum ProviderType {
     OpenaiCompat,
     Anthropic,
+}
+
+impl ProviderType {
+    /// Stable, low-cardinality string form (matches the kebab-case YAML spelling).
+    /// Used as the first component of the internal `state_key` (see
+    /// `ModelConfig::state_key`); must stay stable so a rename of the variant does
+    /// not silently reset every upstream's limiter/breaker state on reload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProviderType::OpenaiCompat => "openai-compat",
+            ProviderType::Anthropic => "anthropic",
+        }
+    }
 }
 
 /// A MoA recipe. Schema is fully defined in Phase 1; the orchestration logic is

@@ -33,9 +33,16 @@ models:
     provider_type: openai-compat
     base_url: http://mock-upstream:9000   # docker-compose service
     api_key_env: MOCK_UPSTREAM_KEY
-    upstream_id: mock-gpt
+    upstream_id: mock-gpt                  # OPTIONAL low-cardinality metrics label
+    # NOTE: `upstream_id` is only a human-facing label (Prometheus `upstream_id`
+    # + the client `moaray` debug field); it defaults to `name`. It does NOT
+    # decide which models share a rate-limit bucket / breaker. Bucket sharing is
+    # keyed by the upstream identity (provider_type + base_url + api_key_env), so
+    # two models with the same triple share one bucket (no per-upstream-cap
+    # bypass), and renaming a model or its upstream_id preserves limiter/breaker
+    # state across a hot reload (SIGHUP).
     # Optional per-upstream limits, shared by passthrough + MoA arms that resolve
-    # to this upstream_id (MoA fan-out cannot bypass them).
+    # to the same upstream identity (MoA fan-out cannot bypass them).
     # rate_limit: {rps: 100, burst: 200}
     # max_concurrency: 64                 # in-flight request ceiling
 
