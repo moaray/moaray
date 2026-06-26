@@ -64,6 +64,11 @@ enum WriterMsg {
     /// Flush everything buffered, then ack on the channel so the caller knows the
     /// DB is durable up to this point.
     Flush(crossbeam_channel::Sender<()>),
+    /// Drain whatever is buffered and exit the writer loop. Needed because other
+    /// `SqliteSink` clones (e.g. in `AppState` + the SIGHUP reloader task) keep a
+    /// sender alive, so the writer can NOT rely on channel disconnect to terminate
+    /// on a clean shutdown — it must be told to stop explicitly.
+    Stop,
 }
 
 /// The production SQLite-backed sink. Cloneable-cheap via the inner `Sender`.
@@ -106,6 +111,15 @@ impl SqliteSink {
             },
         ))
     }
+
+    /// Test-only: a second sink sharing the same writer channel, mimicking the
+    /// production case where `AppState` holds a `SqliteSink` clone past shutdown.
+    #[cfg(test)]
+    fn clone_for_test(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 impl UsageSink for SqliteSink {
@@ -123,41 +137,44 @@ impl UsageSink for SqliteSink {
 }
 
 impl UsageWriterHandle {
-    /// Flush everything enqueued so far, then join the writer thread — bounded by
-    /// `timeout`. On timeout the thread is **detached** (we drop the join handle):
-    /// a stuck writer must not hang process exit (best-effort posture, DP4).
+    /// Flush everything enqueued so far, then stop + join the writer thread —
+    /// the whole sequence bounded by `timeout`. On timeout the thread is
+    /// **detached** (we drop the join handle): a stuck writer must never hang
+    /// process exit (best-effort posture, DP4).
+    ///
+    /// All sends here are bounded (`send_timeout`/`send_deadline`), never the
+    /// plain blocking `send`: if the channel is full AND the writer has stalled
+    /// (DB lock / disk stall), a blocking enqueue of the flush/stop sentinel would
+    /// itself wait forever and the detach path would never be reached.
     pub fn flush_and_join(mut self, timeout: Duration) {
-        // Ask the writer to flush and ack. If the channel is gone the writer
-        // already exited; nothing to flush.
+        let deadline = std::time::Instant::now() + timeout;
+
+        // 1. Ask the writer to flush and ack — bounded by the remaining budget.
         let (ack_tx, ack_rx) = bounded::<()>(1);
-        if self.tx.send(WriterMsg::Flush(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(timeout);
+        if self
+            .tx
+            .send_deadline(WriterMsg::Flush(ack_tx), deadline)
+            .is_ok()
+        {
+            let _ = ack_rx.recv_deadline(deadline);
         }
-        // Drop our sender so the writer's recv loop sees a disconnect and exits.
-        // We must drop the cloned sender; replace with a closed one.
-        drop_sender(&mut self.tx);
+
+        // 2. Tell the writer to stop explicitly (other sink clones may still hold
+        //    a sender, so dropping ours is NOT enough to disconnect rx). Bounded.
+        let _ = self.tx.send_deadline(WriterMsg::Stop, deadline);
+
+        // 3. Bounded join: poll is_finished; detach on timeout.
         if let Some(join) = self.join.take() {
-            // Best-effort bounded join: poll is_finished briefly; detach on timeout.
-            let deadline = std::time::Instant::now() + timeout;
             while !join.is_finished() {
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!("usage writer did not finish within flush timeout; detaching");
                     return; // detach: drop join handle without blocking
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(2));
             }
             let _ = join.join();
         }
     }
-}
-
-/// Replace a sender with a disconnected one so the writer loop terminates.
-fn drop_sender(tx: &mut Sender<WriterMsg>) {
-    // Create a throwaway channel and swap; the original sender is dropped here,
-    // and the throwaway receiver is dropped immediately, so the swapped-in sender
-    // is itself disconnected. This guarantees the writer's recv() ends.
-    let (dead, _) = bounded::<WriterMsg>(1);
-    *tx = dead;
 }
 
 /// Apply the schema + durability pragmas. WAL + NORMAL is the standard
@@ -172,9 +189,11 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
 
 /// The dedicated writer thread: drains the channel, batching inserts into
 /// transactions. Owns the `Connection` exclusively (SQLite single-writer).
+/// Exits on an explicit `Stop` message OR when every sender has been dropped.
 fn writer_loop(mut conn: Connection, rx: Receiver<WriterMsg>, batch: usize) {
     let mut buf: Vec<UsageRecord> = Vec::with_capacity(batch);
-    loop {
+    let mut stop = false;
+    while !stop {
         // Block for the next message; exit when all senders are gone.
         let first = match rx.recv() {
             Ok(m) => m,
@@ -184,6 +203,7 @@ fn writer_loop(mut conn: Connection, rx: Receiver<WriterMsg>, batch: usize) {
         match first {
             WriterMsg::Row(r) => buf.push(*r),
             WriterMsg::Flush(ack) => pending_ack = Some(ack),
+            WriterMsg::Stop => stop = true,
         }
         // Greedily drain whatever else is ready, up to the batch size.
         while buf.len() < batch {
@@ -191,6 +211,10 @@ fn writer_loop(mut conn: Connection, rx: Receiver<WriterMsg>, batch: usize) {
                 Ok(WriterMsg::Row(r)) => buf.push(*r),
                 Ok(WriterMsg::Flush(ack)) => {
                     pending_ack = Some(ack);
+                    break;
+                }
+                Ok(WriterMsg::Stop) => {
+                    stop = true;
                     break;
                 }
                 Err(_) => break,
@@ -206,7 +230,7 @@ fn writer_loop(mut conn: Connection, rx: Receiver<WriterMsg>, batch: usize) {
             let _ = ack.send(());
         }
     }
-    // Final drain on disconnect (rows enqueued before the senders dropped).
+    // Final drain (rows enqueued before Stop / before the senders dropped).
     if !buf.is_empty() {
         let _ = flush_batch(&mut conn, &buf);
     }
@@ -316,6 +340,31 @@ mod tests {
         }
         handle.flush_and_join(Duration::from_secs(5));
         assert_eq!(row_count(&path), 50);
+    }
+
+    #[test]
+    fn flush_and_join_stops_even_when_a_sink_clone_is_still_held() {
+        // Mirrors production: AppState (and the SIGHUP reloader task) keep a
+        // SqliteSink clone alive past shutdown. The writer must terminate via the
+        // explicit Stop message, NOT by waiting for channel disconnect — otherwise
+        // flush_and_join would block until timeout and detach on every clean exit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let (sink, handle) = SqliteSink::new(&path, 1024, 64).unwrap();
+        // A second live sender, as AppState would hold.
+        let still_held = sink.clone_for_test();
+        for i in 0..10 {
+            sink.record(rec(&format!("req-{i}")));
+        }
+        let start = std::time::Instant::now();
+        // Generous timeout; if Stop works this returns near-instantly, well under it.
+        handle.flush_and_join(Duration::from_secs(30));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "writer must stop promptly via Stop, not wait for disconnect/timeout"
+        );
+        assert_eq!(row_count(&path), 10);
+        drop(still_held);
     }
 
     #[test]

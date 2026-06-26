@@ -160,7 +160,11 @@ pub fn compute_cost(
         (num + mtok / 2) / mtok
     };
     let cost = round_div(pt, pp) + round_div(ct, cp);
-    Some(cost as i64)
+    // Guard the final narrowing: a pathologically large token count × price can
+    // exceed i64::MAX even after the /1e6 divide. Saturate to i64::MAX rather than
+    // truncate/wrap into a wrong (or negative) cost. tokens/prices are validated
+    // non-negative, so a negative result is unreachable; clamp it to 0 defensively.
+    Some(cost.clamp(0, i64::MAX as i128) as i64)
 }
 
 #[cfg(test)]
@@ -222,5 +226,19 @@ mod tests {
         );
         // 1e12 * 1e9 / 1e6 = 1e15 nano-USD, fits in i64.
         assert_eq!(cost, Some(1_000_000_000_000_000));
+    }
+
+    #[test]
+    fn saturates_instead_of_wrapping_on_extreme_inputs() {
+        // i64::MAX tokens at i64::MAX nano/Mtok: even after /1e6 the result blows
+        // past i64::MAX. Must saturate to i64::MAX, never wrap into a negative.
+        let cost = compute_cost(
+            Some(i64::MAX),
+            Some(i64::MAX),
+            Some(i64::MAX),
+            Some(i64::MAX),
+        );
+        assert_eq!(cost, Some(i64::MAX), "extreme cost saturates, never wraps");
+        assert!(cost.unwrap() >= 0, "cost is never negative");
     }
 }
