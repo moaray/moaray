@@ -85,7 +85,19 @@ fn valid_price(
                     value: v.to_string(),
                 });
             }
-            Ok(Some((v * 1_000_000_000.0).round() as i64))
+            // Reject a finite-but-absurd price that would overflow i64 when scaled
+            // to nano-USD/Mtok: the float→i64 cast saturates silently, which would
+            // accept a different price than configured. This is the only price
+            // normalization point, so reject here rather than store a wrong snapshot.
+            let nano = (v * 1_000_000_000.0).round();
+            if nano > i64::MAX as f64 {
+                return Err(ConfigError::BadPrice {
+                    model: model.to_string(),
+                    field,
+                    value: v.to_string(),
+                });
+            }
+            Ok(Some(nano as i64))
         }
     }
 }

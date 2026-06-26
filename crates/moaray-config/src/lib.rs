@@ -150,6 +150,22 @@ models:
     }
 
     #[test]
+    fn rejects_absurd_price_that_would_overflow_nano_i64() {
+        // ~1e19 USD/Mtok * 1e9 > i64::MAX nano — must reject, not silently saturate.
+        let y = r#"
+auth:
+  keys: [{id: a, key_env: INBOUND_KEY, allow_models: [gpt]}]
+models:
+  - name: gpt
+    provider_type: openai-compat
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_KEY
+    price_prompt_per_mtok_usd: 1e19
+"#;
+        assert!(matches!(reject(y), ConfigError::BadPrice { .. }));
+    }
+
+    #[test]
     fn parses_usage_store_with_defaults() {
         let y = r#"
 server:

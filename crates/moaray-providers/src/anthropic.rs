@@ -157,7 +157,99 @@ impl Provider for AnthropicProvider {
         map_upstream_status(resp.status().as_u16())?;
         let bytes = resp.bytes().await.map_err(|e| map_reqwest_error(&e))?;
         let anthropic: Value = serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamError)?;
+        // Raw-key absence mitigation (DP2), structured path: `anthropic_to_openai`
+        // ALWAYS emits a `usage` object (zeros when the upstream omits it), so a
+        // genuinely-absent usage would otherwise be booked as a measured `0,0`
+        // (status `ok`, cost 0 = "free") by the MoA accounting path. Judge absence
+        // on the RAW upstream `usage` key here and drop the synthetic usage so the
+        // orchestrator sees `usage: None` → `ok_no_usage`/NULL. Genuinely-zero
+        // upstreams (key present) keep their `0,0` untouched.
+        let usage_absent = anthropic.get("usage").is_none();
         let openai_resp = anthropic_to_openai(&anthropic, &model)?;
-        serde_json::from_value(openai_resp).map_err(|_| Error::Internal)
+        let mut chat: ChatResponse =
+            serde_json::from_value(openai_resp).map_err(|_| Error::Internal)?;
+        if usage_absent {
+            chat.usage = None;
+        }
+        Ok(chat)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ctx() -> ReqCtx {
+        ReqCtx {
+            request_id: "rid".into(),
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+            caller_key_id: "k".into(),
+            model: "claude".into(),
+        }
+    }
+
+    fn req() -> ChatRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap()
+    }
+
+    /// chat(): when the raw Anthropic response OMITS `usage`, the structured
+    /// response must carry `usage: None` (not a synthetic 0,0) so the MoA
+    /// accounting path books `ok_no_usage`/NULL, not a free measured row.
+    #[tokio::test]
+    async fn chat_usage_absent_yields_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": "end_turn"
+                // NOTE: no `usage` key
+            })))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("up", server.uri(), "sk", 1024, Client::new());
+        let resp = p.chat(&ctx(), req()).await.unwrap();
+        assert!(
+            resp.usage.is_none(),
+            "absent upstream usage must map to None"
+        );
+    }
+
+    /// chat(): a genuinely-zero usage (key PRESENT) is preserved, not dropped.
+    #[tokio::test]
+    async fn chat_usage_present_zero_is_preserved() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("up", server.uri(), "sk", 1024, Client::new());
+        let resp = p.chat(&ctx(), req()).await.unwrap();
+        let usage = resp.usage.expect("present usage preserved");
+        assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(
+            usage.get("completion_tokens").and_then(|v| v.as_i64()),
+            Some(0)
+        );
     }
 }
