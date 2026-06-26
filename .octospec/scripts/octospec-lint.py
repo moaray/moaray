@@ -11,6 +11,14 @@ Scope is opt-in: only directories that hold knowledge units are linted
 fill-in templates, and OKF index/log structural files are not knowledge units and
 are never linted.
 
+Beyond OKF conformance, the lint also enforces **Finish-phase completeness**: a
+completed task must close out with a journal. Every `tasks/<slug>/brief.md` must
+have a matching `journal/shared/<slug>.md`, UNLESS the brief frontmatter declares
+an in-progress status (`status: in-progress|wip|planned|draft|todo`). This turns
+the Finish phase from soft guidance into a hard gate so delivered work cannot
+silently skip its team-visible record — while leaving a deliberate, explicit
+escape hatch for work that is genuinely still in flight.
+
 Usage:  scripts/octospec-lint.sh [root]   (default root = ".")
 Exit:   0 = all conformant, 1 = one or more violations, 2 = usage/setup error.
 """
@@ -49,6 +57,70 @@ def is_knowledge_file(rel: str) -> bool:
 
 def strip_bom(s: str) -> str:
     return s[1:] if s and s[0] == "\ufeff" else s
+
+
+# Brief frontmatter status values that mark a task as still in flight, so it is
+# legitimately allowed to have no Finish-phase journal yet.
+IN_PROGRESS_STATUS = {"in-progress", "in_progress", "wip", "planned", "draft", "todo"}
+
+
+def _frontmatter(path: str):
+    """Return the parsed frontmatter mapping for a .md file, or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    text = strip_bom(raw).replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    close_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            close_idx = i
+            break
+    if close_idx is None:
+        return None
+    try:
+        data = yaml.safe_load("\n".join(lines[1:close_idx]))
+    except yaml.YAMLError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def check_finish_completeness(root: str):
+    """Return violations for completed tasks missing a Finish-phase journal.
+
+    A task = a `tasks/<slug>/brief.md`. It must have `journal/shared/<slug>.md`
+    unless its brief frontmatter declares an in-progress status. The slug is the
+    brief's parent directory name (authoritative), not the frontmatter field.
+    """
+    violations = []
+    briefs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if ".git" in dirpath.split(os.sep):
+            continue
+        # a task brief = .../tasks/<slug>/brief.md
+        if "brief.md" in filenames and os.path.basename(os.path.dirname(dirpath)) == "tasks":
+            briefs.append(os.path.join(dirpath, "brief.md"))
+    for brief in sorted(briefs):
+        slug = os.path.basename(os.path.dirname(brief))
+        fm = _frontmatter(brief) or {}
+        status = str(fm.get("status", "")).strip().lower()
+        if status in IN_PROGRESS_STATUS:
+            continue  # explicitly in-flight: journal not yet required
+        # journal/shared lives at the .octospec root, sibling of tasks/.
+        octospec_root = os.path.dirname(os.path.dirname(os.path.dirname(brief)))
+        journal = os.path.join(octospec_root, "journal", "shared", f"{slug}.md")
+        if not os.path.isfile(journal):
+            rel = os.path.relpath(brief, root).replace(os.sep, "/")
+            jrel = os.path.relpath(journal, root).replace(os.sep, "/")
+            violations.append(
+                f"{rel}: completed task missing Finish-phase journal ({jrel}); "
+                f"run /octospec-finish or set the brief's status to in-progress"
+            )
+    return violations
 
 
 def check_file(path: str):
@@ -118,6 +190,9 @@ def main(argv):
     violations = []
     for f in md_files:
         violations.extend(check_file(f))
+
+    # Finish-phase completeness: completed tasks must have a journal.
+    violations.extend(check_finish_completeness(root))
 
     if violations:
         for v in violations:
